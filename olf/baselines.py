@@ -273,6 +273,7 @@ class AblatedOrganism(Organism):
         consequences_final = self.semantics.predict_consequences(sigma_t, a_cand)
 
         # 8. Veto boundary
+        danger = 0.0
         if self.ablation_type == "no_veto_boundary":
             a_steered = a_cand
             veto_verdict = "release"
@@ -323,6 +324,7 @@ class AblatedOrganism(Organism):
             "consequences": consequences_final,
             "impasse": impasse_detected,
             "risk": risk,
+            "danger": danger,
             "verdict": veto_verdict,
         }
 

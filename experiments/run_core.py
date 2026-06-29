@@ -1,3 +1,6 @@
+import json
+import os
+
 import numpy as np
 import torch
 import torch.optim as optim
@@ -21,6 +24,17 @@ from olf.organism import Organism
 from olf.baselines import MLPBaselineAgent, AblatedOrganism
 from olf.seeding import set_seed
 from experiments.metrics import MetricTracker
+
+
+# v0.3.2.11: Core tasks for FLC ablation comparison.
+# These are the primary behavioral benchmarks where FLC's contribution
+# is most likely to be measurable.
+FLC_TASKS = [
+    "self_state_meaning",
+    "delayed_lure",
+    "triadic_binding",
+    "target_threat",
+]
 
 
 class AbstractionUnseenRandomPosEnv(AbstractionUnseenEnv):
@@ -213,9 +227,6 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
     Trains the OLF agent (or ablation/MLP baseline) using Policy Gradients
     augmented with triadic consequence updates and RTCM retrograde causal credit attribution.
     """
-    import json
-    import os
-
     set_global_seed(seed)
     agent.to(device)
     # Decoupled optimizers: the policy head needs a much smaller learning
@@ -797,6 +808,151 @@ def run_task_experiment(task, ablations):
         "Ablations": ablation_results
     }
 
+def _evaluate_with_diagnostics(agent, task_name, seed, num_episodes=20):
+    """Evaluate an agent with diagnostics enabled, returning per-episode metrics."""
+    set_global_seed(seed)
+    agent.eval()
+    agent.diag_mode = True
+    EnvClass = ENV_MAP[task_name]
+    env = EnvClass(seed=seed)
+
+    episodes = []
+    for _ in range(num_episodes):
+        obs = env.reset()
+        agent.reset_state()
+        if hasattr(agent, "reset_diag"):
+            agent.reset_diag()
+
+        done = False
+        info = {"status": "running"}
+        verdicts = []
+        dangers = []
+        while not done:
+            action, action_info = agent.select_action(obs, evaluate=True)
+            next_obs, reward, done, info = env.step(action)
+            verdicts.append(action_info.get("verdict", "release"))
+            dangers.append(float(action_info.get("danger", 0.0)))
+            was_lethal = 1.0 if info["status"] in ("death", "starvation") else 0.0
+            hunger_delta = next_obs[2] - obs[2]
+            fatigue_delta = next_obs[3] - obs[3]
+            agent.learn_consequence(reward, was_lethal, hunger_delta, fatigue_delta)
+            obs = next_obs
+
+        episodes.append({
+            "status": info["status"],
+            "verdict": verdicts[-1] if verdicts else "release",
+            "rollback_seen": any(v == "rollback" for v in verdicts),
+            "mean_danger": float(np.mean(dangers)) if dangers else 0.0,
+            "max_danger": float(np.max(dangers)) if dangers else 0.0,
+        })
+
+    agent.diag_mode = False
+    return episodes
+
+
+def run_flc_ablation(seeds=None, num_train=300, num_eval=20):
+    """Run FLC ablation suite: OLF vs no_future_latent across core tasks.
+
+    Returns a dict with per-task results comparing full OLF to the
+    no_future_latent ablation, including success rate, danger, rollback
+    rate, and seed variance.
+    """
+    if seeds is None:
+        seeds = [42, 43, 44]
+
+    results = {}
+    for task in FLC_TASKS:
+        print(f"\n--- FLC ablation: {task} ---")
+        per_condition = {}
+
+        for condition, ablation_type in [
+            ("olf", None),
+            ("no_future_latent", "no_future_latent"),
+        ]:
+            seed_stats = []
+            for seed in seeds:
+                set_global_seed(seed)
+                if ablation_type is None:
+                    agent = Organism(obs_dim=18, action_dim=3)
+                else:
+                    agent = AblatedOrganism(
+                        obs_dim=18, action_dim=3, ablation_type=ablation_type
+                    )
+                agent = train_agent(agent, task, num_episodes=num_train, seed=seed)
+
+                eval_episodes = _evaluate_with_diagnostics(
+                    agent, task, seed + 100, num_eval
+                )
+
+                successes = sum(
+                    1 for ep in eval_episodes if ep["status"] == "success"
+                )
+                deaths = sum(
+                    1 for ep in eval_episodes
+                    if ep["status"] in ("death", "starvation")
+                )
+                mean_dangers = [ep["mean_danger"] for ep in eval_episodes]
+                max_dangers = [ep["max_danger"] for ep in eval_episodes]
+                rollbacks = sum(
+                    1 for ep in eval_episodes if ep["rollback_seen"]
+                )
+
+                seed_stats.append({
+                    "seed": seed,
+                    "success_rate": successes / max(1, len(eval_episodes)),
+                    "safety_rate": 1.0 - deaths / max(1, len(eval_episodes)),
+                    "mean_danger": (
+                        float(np.mean(mean_dangers)) if mean_dangers else 0.0
+                    ),
+                    "max_danger": (
+                        float(np.max(max_dangers)) if max_dangers else 0.0
+                    ),
+                    "rollback_rate": rollbacks / max(1, len(eval_episodes)),
+                    "total_episodes": len(eval_episodes),
+                })
+
+            per_condition[condition] = {
+                "per_seed": seed_stats,
+                "success_mean": float(np.mean([s["success_rate"] for s in seed_stats])),
+                "success_std": float(np.std([s["success_rate"] for s in seed_stats])),
+                "safety_mean": float(np.mean([s["safety_rate"] for s in seed_stats])),
+                "safety_std": float(np.std([s["safety_rate"] for s in seed_stats])),
+                "danger_mean": float(np.mean([s["mean_danger"] for s in seed_stats])),
+                "danger_std": float(np.std([s["mean_danger"] for s in seed_stats])),
+                "rollback_mean": float(np.mean([s["rollback_rate"] for s in seed_stats])),
+                "rollback_std": float(np.std([s["rollback_rate"] for s in seed_stats])),
+            }
+
+        # Summary delta: how much does FLC change the outcome?
+        olf = per_condition["olf"]
+        nfl = per_condition["no_future_latent"]
+        delta = {
+            "success_delta": olf["success_mean"] - nfl["success_mean"],
+            "danger_delta": olf["danger_mean"] - nfl["danger_mean"],
+            "rollback_delta": olf["rollback_mean"] - nfl["rollback_mean"],
+        }
+
+        results[task] = {
+            "conditions": per_condition,
+            "delta": delta,
+        }
+
+        print(
+            f"  OLF: success={olf['success_mean']:.1%} ± {olf['success_std']:.1%}, "
+            f"danger={olf['danger_mean']:.4f}, rollback={olf['rollback_mean']:.1%}"
+        )
+        print(
+            f"  NFL: success={nfl['success_mean']:.1%} ± {nfl['success_std']:.1%}, "
+            f"danger={nfl['danger_mean']:.4f}, rollback={nfl['rollback_mean']:.1%}"
+        )
+        print(
+            f"  delta: success={delta['success_delta']:+.1%}, "
+            f"danger={delta['danger_delta']:+.4f}, rollback={delta['rollback_delta']:+.1%}"
+        )
+
+    return results
+
+
 def main():
     print("=" * 110)
     print("      ORGANISMIC LATENT FLOW (OLF) THEORETICAL ABLATION SUITE RUNNER (PARALLEL)")
@@ -867,6 +1023,40 @@ def main():
         print(f"{task:<25} | {olf_str:<16} | {mlp_str:<16} | {abl_str:<50}")
         
     print("=" * 115)
+
+    # --- FLC Ablation Suite ---
+    print("\n" + "=" * 115)
+    print(" " * 30 + "FLC ABLATION SUITE (OLF vs no_future_latent)")
+    print("=" * 115)
+
+    flc_results = run_flc_ablation()
+
+    print("\n" + "=" * 115)
+    print(f"{'Task':<25} | {'OLF success':<18} | {'NFL success':<18} | {'Δ success':<12} | {'Δ danger':<12} | {'Δ rollback':<12}")
+    print("-" * 115)
+    for task in FLC_TASKS:
+        if task not in flc_results:
+            continue
+        r = flc_results[task]
+        olf = r["conditions"]["olf"]
+        nfl = r["conditions"]["no_future_latent"]
+        d = r["delta"]
+        print(
+            f"{task:<25} | "
+            f"{olf['success_mean']:.1%} ± {olf['success_std']:.1%}   | "
+            f"{nfl['success_mean']:.1%} ± {nfl['success_std']:.1%}   | "
+            f"{d['success_delta']:+.1%}       | "
+            f"{d['danger_delta']:+.4f}     | "
+            f"{d['rollback_delta']:+.1%}"
+        )
+    print("=" * 115)
+
+    # Save FLC results to ignored output path
+    os.makedirs("results/flc_ablation", exist_ok=True)
+    with open("results/flc_ablation/results.json", "w") as f:
+        json.dump(flc_results, f, indent=2)
+    print("\nFLC ablation results saved to results/flc_ablation/results.json")
+
 
 if __name__ == "__main__":
     main()
