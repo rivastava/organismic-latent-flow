@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "organismic-latent-flow"
+version = "0.3.2"
+description = "Research prototype for Organismic Latent Flow and Future-Latent Control."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+include = ["olf*", "benchmarks*", "experiments*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+  "docs/research_history",
+  "results",
+  "experiments/learning_curves",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/smoke_test.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+exclude = [
+  "docs/research_history",
+  "results",
+  "experiments/learning_curves",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
