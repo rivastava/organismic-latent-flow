@@ -13,6 +13,9 @@ from olf.future import FutureLatentControl
 from olf.arbitrator import ModeArbitrator, ImpasseDetector, ReadinessGate, DiagnosticDecayTracker
 from olf.invention import InventionGenerator
 from olf.motor import MotorCortex
+from olf.motor_memory import MotorMemory
+from olf.attractor import AttractorField
+from olf.salience import ProspectiveSalienceGate
 
 class Organism(nn.Module):
     """
@@ -60,7 +63,6 @@ class Organism(nn.Module):
         # success, reward) with explicit delta. InventionGenerator queries
         # this to compose candidate action sequences from previously-observed
         # successful transformations, rather than just replaying old actions.
-        from olf.motor_memory import MotorMemory
         self.motor_memory = MotorMemory(latent_dim=latent_dim, action_dim=action_dim)
         self.semantics = TriadicSemantics(
             spm_dim=latent_dim,
@@ -92,13 +94,11 @@ class Organism(nn.Module):
 
         # Constitution §6: Attractor field. Goals are attractors in
         # latent space, not symbolic commands.
-        from olf.attractor import AttractorField
         self.attractor_field = AttractorField(latent_dim=latent_dim)
 
         # Action-Sphere RTCM memo §8: Prospective salience gate. Decides
         # what events to write into long-term memory based on estimated
         # future causal value, not just because they happened.
-        from olf.salience import ProspectiveSalienceGate
         self.salience_gate = ProspectiveSalienceGate(latent_dim=latent_dim)
 
         # Policy model for physical moves (dx, dy, u)
@@ -314,6 +314,21 @@ class Organism(nn.Module):
         sigma_flat = sigma_t.reshape(base_action.shape[0], -1)
         return self.flc(self.h, sigma_flat, self_state, base_action)
 
+    @staticmethod
+    def _compute_entity_affordance(consequences):
+        """Extract per-entity affordance from consequence predictions.
+
+        affordance_i = value_i - risk_i - uncertainty_i.
+
+        Used by both action steering (directional gradient) and readiness
+        gating (scalar pressure). Extracted to a single helper to avoid
+        duplicating the extraction logic.
+        """
+        entity_value = consequences["value"].squeeze(-1)
+        entity_risk = consequences["terminal_risk"].squeeze(-1)
+        entity_uncert = consequences["uncertainty"].squeeze(-1)
+        return entity_value - entity_risk - entity_uncert
+
     def select_action(self, obs, evaluate=False):
         """Steps the OLF organism forward through the full organismic loop."""
         device = next(self.parameters()).device
@@ -408,10 +423,7 @@ class Organism(nn.Module):
         # parameters — uses the value predictions directly. This is the
         # "entity consequence gradient → action pressure" path.
         with torch.no_grad():
-            entity_value = consequences["value"].squeeze(-1)
-            entity_risk = consequences["terminal_risk"].squeeze(-1)
-            entity_uncert = consequences["uncertainty"].squeeze(-1)
-            entity_affordance = entity_value - entity_risk - entity_uncert
+            entity_affordance = self._compute_entity_affordance(consequences)
             afford_weights = torch.softmax(entity_affordance, dim=-1)
             afford_dir = (afford_weights.unsqueeze(-1) * entities_pos).sum(dim=1)
             afford_dir = F.normalize(afford_dir + 1e-8, p=2, dim=-1)
@@ -443,10 +455,7 @@ class Organism(nn.Module):
         # Per-entity: affordance_i = value_i - risk_i - uncertainty_i
         # Scalar summary: mean over entities.
         with torch.no_grad():
-            entity_value = consequences["value"].squeeze(-1)
-            entity_risk = consequences["terminal_risk"].squeeze(-1)
-            entity_uncert = consequences["uncertainty"].squeeze(-1)
-            entity_affordance = entity_value - entity_risk - entity_uncert
+            entity_affordance = self._compute_entity_affordance(consequences)
             affordance_pressure = float(entity_affordance.mean().item())
 
         # v0.3.1.2 diagnostic: record impasse state and pre-arbitration

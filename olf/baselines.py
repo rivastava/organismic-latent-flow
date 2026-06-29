@@ -15,6 +15,7 @@ import torch.nn as nn
 import numpy as np
 
 from olf.organism import Organism
+from olf.motor_memory import _EmptyMotorMemory
 
 
 class MLPBaselineAgent(nn.Module):
@@ -136,7 +137,6 @@ class AblatedOrganism(Organism):
         # v3: internal ablation — disable motor_memory (the
         # InventionGenerator's transformation-composition memory).
         if ablation_type == "no_motor_memory":
-            from olf.motor_memory import _EmptyMotorMemory
             self.motor_memory = _EmptyMotorMemory(latent_dim=latent_dim, action_dim=action_dim)
 
     def select_action(self, obs, evaluate=False):
@@ -210,10 +210,7 @@ class AblatedOrganism(Organism):
 
         # v0.3.2.6: compute affordance_pressure from consequence predictions
         with torch.no_grad():
-            entity_value = consequences["value"].squeeze(-1)
-            entity_risk = consequences["terminal_risk"].squeeze(-1)
-            entity_uncert = consequences["uncertainty"].squeeze(-1)
-            entity_affordance = entity_value - entity_risk - entity_uncert
+            entity_affordance = self._compute_entity_affordance(consequences)
             affordance_pressure = float(entity_affordance.mean().item())
 
         veto_verdict = self.prev_veto_verdict
