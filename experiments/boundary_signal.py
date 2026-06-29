@@ -115,9 +115,9 @@ def run_single_config(task_name, seed, num_episodes=150, num_eval=20):
         "verdict_dist": verdict_dist,
         "total_steps": len(step_entries),
         "total_diag_entries": len(all_entries),
-        "bpsi_target_mean": _mean([item["target_mean"] for item in recent_bpsi]),
-        "bpsi_target_max": float(np.max([item["target_max"] for item in recent_bpsi])) if recent_bpsi else 0.0,
-        "bpsi_target_nonzero_rate": _mean([item["target_nonzero_rate"] for item in recent_bpsi]),
+        "bpsi_target_mean": _mean([item["attributable_mean"] for item in recent_bpsi]),
+        "bpsi_target_max": float(np.max([item["attributable_max"] for item in recent_bpsi])) if recent_bpsi else 0.0,
+        "bpsi_target_nonzero_rate": _mean([item["attributable_nonzero_rate"] for item in recent_bpsi]),
         "bpsi_loss_last": float(recent_bpsi[-1]["loss"]) if recent_bpsi else 0.0,
     }
 

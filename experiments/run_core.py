@@ -127,6 +127,20 @@ def _passive_boundary_target(obs):
     return float(min(1.0, 0.7 + 0.3 * ((boundary_pressure - 0.8) / 0.2)))
 
 
+def _attributable_boundary_target(boundary_target, passive_target, was_lethal):
+    """Action-attributable B_psi target.
+
+    B_psi is queried as an excess-risk model during inference:
+    B_psi(h, a, dh_pred) - B_psi(h, zero_action, dh_pred). Training it on
+    absolute boundary proximity makes that difference collapse when passive
+    drift is already risky. The target therefore labels only the risk added by
+    the action relative to passive drift.
+    """
+    if was_lethal:
+        return 1.0
+    return max(0.0, float(boundary_target) - float(passive_target))
+
+
 def _compute_counterfactual_loss(
     agent, episode_obs, episode_actions, episode_self_states, episode_raw_rewards
 ):
@@ -543,8 +557,19 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
                                 consequence_loss += nn.MSELoss()(consequences_pred["terminal_risk"][0, ent_idx], target_cons[1:2])
 
                     # v0.3.2.11: Accumulate B_psi training data on EVERY step.
-                    # B_psi learns boundary deformation risk from observed
-                    # body-boundary proximity, plus a no-action baseline sample.
+                    # B_psi learns ACTION-ATTRIBUTABLE boundary risk: how much
+                    # does this action increase risk relative to passive drift?
+                    #
+                    # Target for action sample:
+                    #   attributable_risk = max(0, proximity_with_action - proximity_passive)
+                    #   This is > 0 only when the action makes things worse than doing nothing.
+                    #   Death always has attributable_risk = 1.0.
+                    #
+                    # Target for zero-action sample:
+                    #   Always 0.0: zero action has zero attributable risk by definition.
+                    #
+                    # At inference: danger = B_psi(a) - B_psi(0) ~= B_psi(a),
+                    # which is non-zero only when the action increases boundary risk.
                     if bpsi_enabled:
                         consequences_veto = agent.semantics.predict_consequences(sigma_t, act_taken)
                         dh_pred_veto = consequences_veto["dh_pred"].mean(dim=1)
@@ -561,22 +586,28 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
                             episode_zero_boundary_targets[idx]
                             if idx < len(episode_zero_boundary_targets) else 0.0
                         )
+
+                        # Compute attributable risk: how much worse is the action
+                        # compared to passive drift?
+                        attributable_risk = _attributable_boundary_target(
+                            boundary_target, zero_target, was_lethal_step
+                        )
+
                         action_weight = 1.0
                         if was_lethal_step:
                             action_weight = 12.0
-                        elif boundary_target > zero_target + 0.05:
+                        elif attributable_risk > 0.05:
                             action_weight = 4.0
-                        elif zero_target > boundary_target + 0.05:
-                            action_weight = 2.0
 
                         episode_bpsi_data.append((
                             agent.h.clone().detach(),
                             act_taken.clone().detach(),
                             dh_pred_veto.clone().detach(),
-                            torch.tensor([[boundary_target]], device=device),
+                            torch.tensor([[attributable_risk]], device=device),
                             torch.tensor([[action_weight]], device=device),
                         ))
 
+                        # Zero-action sample: target is always 0.0
                         a_zero = torch.zeros_like(act_taken)
                         consequences_zero = agent.semantics.predict_consequences(sigma_t, a_zero)
                         dh_pred_zero = consequences_zero["dh_pred"].mean(dim=1)
@@ -584,7 +615,7 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
                             agent.h.clone().detach(),
                             a_zero.clone().detach(),
                             dh_pred_zero.clone().detach(),
-                            torch.tensor([[zero_target]], device=device),
+                            torch.tensor([[0.0]], device=device),
                             torch.tensor([[1.0]], device=device),
                         ))
 
@@ -655,9 +686,9 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
             agent._bpsi_training_stats.append({
                 "episode": episode,
                 "n": len(targets),
-                "target_mean": float(np.mean(targets)) if targets else 0.0,
-                "target_max": float(np.max(targets)) if targets else 0.0,
-                "target_nonzero_rate": float(np.mean([t > 0.0 for t in targets])) if targets else 0.0,
+                "attributable_mean": float(np.mean(targets)) if targets else 0.0,
+                "attributable_max": float(np.max(targets)) if targets else 0.0,
+                "attributable_nonzero_rate": float(np.mean([t > 0.0 for t in targets])) if targets else 0.0,
                 "weight_mean": float(np.mean(weights)) if weights else 0.0,
                 "loss": bpsi_loss_value,
             })
