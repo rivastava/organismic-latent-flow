@@ -87,6 +87,30 @@ def set_global_seed(seed):
     set_seed(seed)
 
 
+def _tensor_health(tensor):
+    """Small finite-value summary for training diagnostics."""
+    with torch.no_grad():
+        t = tensor.detach()
+        finite = torch.isfinite(t)
+        finite_values = t[finite]
+        return {
+            "shape": list(t.shape),
+            "all_finite": bool(finite.all().item()),
+            "has_nan": bool(torch.isnan(t).any().item()),
+            "has_inf": bool(torch.isinf(t).any().item()),
+            "norm": (
+                float(torch.linalg.norm(finite_values).item())
+                if finite_values.numel()
+                else 0.0
+            ),
+            "max_abs": (
+                float(finite_values.abs().max().item())
+                if finite_values.numel()
+                else 0.0
+            ),
+        }
+
+
 def _boundary_proximity_target(obs, next_obs, was_lethal):
     """Self-supervised B_psi target from distance to the organism boundary.
 
@@ -517,6 +541,30 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
                     if hasattr(agent, "apply_future_control"):
                         pred_move, _ = agent.apply_future_control(
                             sigma_t, self_state, pred_move
+                        )
+
+                    # Non-finite diagnostics: if any policy output is non-finite,
+                    # crash loudly with full context so the source is identifiable.
+                    # Do NOT silently continue: non-finite policy outputs indicate
+                    # a real numerical instability that must be diagnosed.
+                    if not torch.isfinite(pred_move).all():
+                        _ctx = {
+                            "task": task_name,
+                            "seed": seed,
+                            "agent_type": agent_type,
+                            "ablation_type": getattr(agent, "ablation_type", None),
+                            "episode": episode,
+                            "step": idx,
+                            "h": _tensor_health(agent.h),
+                            "spm_trace": _tensor_health(spm_trace),
+                            "sigma_t": _tensor_health(sigma_t),
+                            "policy_inputs": _tensor_health(policy_inputs),
+                            "pred_move_health": _tensor_health(pred_move),
+                            "pred_move": pred_move.detach().tolist(),
+                        }
+                        raise RuntimeError(
+                            f"[non-finite diagnostics] Non-finite pred_move at "
+                            f"episode={episode} step={idx}  {_ctx}"
                         )
 
                     # 3-dim policy: dx, dy, u (use action).
