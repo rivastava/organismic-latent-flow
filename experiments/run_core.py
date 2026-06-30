@@ -260,6 +260,47 @@ def _compute_counterfactual_loss(
 
     return total_loss / len(pairs)
 
+
+def build_training_param_groups(agent, lr):
+    """Build optimizer groups with FLC isolated at a lower learning rate.
+
+    Policy-gradient updates on continuous actions are noisy, so the movement
+    policy uses a small learning rate. The remaining organism parameters keep
+    the prior auxiliary rate, while FLC gets its own much slower group. The FLC
+    split prevents future-latent parameters from destabilizing the policy while
+    preserving the forward FLC path and trainability.
+    """
+    flc_param_ids = (
+        {id(p) for p in agent.flc.parameters()}
+        if hasattr(agent, "flc")
+        else set()
+    )
+
+    policy_params = []
+    flc_params = []
+    other_params = []
+    for name, p in agent.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "movement_policy" in name:
+            policy_params.append(p)
+        elif id(p) in flc_param_ids:
+            flc_params.append(p)
+        else:
+            other_params.append(p)
+
+    groups = []
+    if policy_params:
+        groups.append({"params": policy_params, "lr": lr * 0.01})
+    if other_params:
+        groups.append({"params": other_params, "lr": lr * 0.1})
+    if flc_params:
+        # Evidence from target_threat gradient ablation used lr * 0.001 for
+        # FLC. This is 100x lower than the general organism group.
+        groups.append({"params": flc_params, "lr": lr * 0.001})
+    return groups
+
+
 def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_type="agent"):
     """
     Trains the OLF agent (or ablation/MLP baseline) using Policy Gradients
@@ -274,19 +315,7 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
     # outputs feed into the policy input — even small changes there shift
     # the policy output. This is constitutional — we still learn everything
     # end-to-end, but at appropriate rates.
-    policy_params = []
-    other_params = []
-    for name, p in agent.named_parameters():
-        if not p.requires_grad:
-            continue
-        if "movement_policy" in name:
-            policy_params.append(p)
-        else:
-            other_params.append(p)
-    optimizer = optim.Adam([
-        {"params": policy_params, "lr": lr * 0.01},
-        {"params": other_params, "lr": lr * 0.1},
-    ])
+    optimizer = optim.Adam(build_training_param_groups(agent, lr))
     bpsi_enabled = (
         hasattr(agent, "veto")
         and not hasattr(agent, "net")
