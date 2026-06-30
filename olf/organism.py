@@ -657,6 +657,7 @@ class Organism(nn.Module):
             "future_alignment": float(flc_diag["future_alignment"].reshape(-1)[0].item()),
             "flc_correction_norm": float(flc_diag["flc_correction_norm"].reshape(-1)[0].item()),
             "flc_action_delta_norm": float(flc_diag["flc_action_delta_norm"].reshape(-1)[0].item()),
+            "flc_gain": float(flc_diag["flc_gain"].reshape(-1)[0].item()),
             "risk_with_action": veto_diag.get("risk_with_action", 0.0),
             "veto_boundary_risk": veto_diag.get("veto_boundary_risk", 0.0),
             "risk_baseline": veto_diag.get("risk_baseline", 0.0),
