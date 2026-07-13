@@ -64,6 +64,14 @@ class SphericalPhaseMemory(nn.Module):
         freqs = torch.linspace(0.5, 4.0, rotary_freqs, dtype=torch.float32)
         self.register_buffer("freqs", freqs)
 
+        # Empty memory is a state, not a fresh hallucination on every read.
+        # A coordinate-symmetric unit vector avoids consuming RNG during
+        # replay/evaluation and gives repeated reads a stable meaning.
+        empty_trace = torch.full(
+            (latent_dim,), 1.0 / math.sqrt(latent_dim), dtype=torch.float32
+        )
+        self.register_buffer("empty_trace", empty_trace)
+
         self.reset_memory()
 
     def reset_memory(self):
@@ -115,8 +123,7 @@ class SphericalPhaseMemory(nn.Module):
         device = self.history_weights.device
 
         if self.history is None:
-            rand_vec = torch.randn(1, self.latent_dim, device=device)
-            return rand_vec / (torch.linalg.norm(rand_vec, dim=-1, keepdim=True) + 1e-8)
+            return self.empty_trace.to(device).unsqueeze(0)
 
         # Build per-event time weight using rotary phase cos(w t).
         # Per Action-Sphere RTCM memo §3, time-as-phase. We use the

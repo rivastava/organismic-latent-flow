@@ -9,8 +9,8 @@ import numpy as np
 from olf.organism import Organism
 
 
-def test_attributable_risk_target_death():
-    """Death should always produce attributable_risk = 1.0."""
+def test_sudden_death_from_safe_state_has_high_attributable_risk():
+    """A lethal transition from low pressure should be strongly attributable."""
     from experiments.run_core import (
         _attributable_boundary_target,
         _boundary_proximity_target,
@@ -18,19 +18,36 @@ def test_attributable_risk_target_death():
     )
 
     obs = np.zeros(18, dtype=np.float32)
-    obs[2] = 0.95  # high hunger
-    obs[3] = 0.95  # high fatigue
+    obs[2] = 0.4
+    obs[3] = 0.3
     next_obs = obs.copy()
-    next_obs[2] = 1.0  # dead
 
     target = _boundary_proximity_target(obs, next_obs, was_lethal=True)
     passive = _passive_boundary_target(obs)
     attributable = _attributable_boundary_target(target, passive, was_lethal=True)
 
     assert target == 1.0, f"Death target should be 1.0, got {target}"
-    assert attributable == 1.0, (
-        f"Death attributable risk should be 1.0, got {attributable}"
+    assert attributable > 0.5
+
+
+def test_passive_boundary_crossing_is_not_labeled_fully_action_attributable():
+    """A final action near collapse must not receive a hard target of one."""
+    from experiments.run_core import (
+        _attributable_boundary_target,
+        _boundary_proximity_target,
+        _passive_boundary_target,
     )
+
+    obs = np.zeros(18, dtype=np.float32)
+    obs[2:4] = [0.99, 0.95]
+    next_obs = obs.copy()
+    next_obs[2] = 1.0
+
+    target = _boundary_proximity_target(obs, next_obs, was_lethal=True)
+    baseline = _passive_boundary_target(obs)
+    attributable = _attributable_boundary_target(target, baseline, was_lethal=True)
+
+    assert 0.0 <= attributable < 0.1
 
 
 def test_attributable_risk_target_improvement():
@@ -129,7 +146,14 @@ def test_danger_variance_after_training():
             action, info = agent.select_action(obs, evaluate=True)
             next_obs, reward, done, info_env = env.step(action)
             was_lethal = 1.0 if info_env["status"] in ("death", "starvation") else 0.0
-            agent.learn_consequence(reward, was_lethal, next_obs[2] - obs[2], next_obs[3] - obs[3])
+            agent.learn_consequence(
+                reward,
+                was_lethal,
+                next_obs[2] - obs[2],
+                next_obs[3] - obs[3],
+                next_obs=next_obs,
+                store=False,
+            )
             obs = next_obs
         for entry in agent.diag_buffer:
             if "danger" in entry:

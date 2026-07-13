@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from olf.geometry import log_map_sphere
+
 
 class ActionSphereEvent:
     """Helper for the per-event representation on the sphere.
@@ -161,7 +163,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
         if h_next is not None:
             h_next_n = F.normalize(h_next, p=2, dim=-1)
             entry["h_next"] = h_next_n.clone().detach()
-            entry["effect"] = (h_next_n - h_n).clone().detach()
+            entry["effect"] = log_map_sphere(h_n, h_next_n).clone().detach()
         else:
             entry["h_next"] = None
             entry["effect"] = None
@@ -170,6 +172,35 @@ class RetrogradeTemporalCausalMemory(nn.Module):
         if len(self.history) > self.max_history:
             self.history.pop(0)
         self.t += 1
+
+    def complete_last_step(self, consequence, h_next):
+        """Finish the pending action transition after consequence is observed.
+
+        ``add_step`` is called when an action is released. The resulting latent
+        state is not available until the next observation recouples the
+        organism. This method records that actual endpoint and a tangent-space
+        deformation rather than the Euclidean chord between sphere points.
+        """
+        if not self.history:
+            return
+        entry = self.history[-1]
+        h_before = entry["h"]
+        if h_before.dim() == 1:
+            h_before = h_before.unsqueeze(0)
+        h_next_n = F.normalize(h_next, p=2, dim=-1).to(h_before.device)
+        entry["h_next"] = h_next_n.clone().detach()
+        entry["effect"] = log_map_sphere(h_before, h_next_n).clone().detach()
+
+        c = torch.as_tensor(
+            consequence,
+            dtype=torch.float32,
+            device=h_before.device,
+        ).reshape(1, -1)
+        if c.shape[-1] != 4:
+            padded = torch.zeros(1, 4, device=h_before.device)
+            padded[..., : min(4, c.shape[-1])] = c[..., : min(4, c.shape[-1])]
+            c = padded
+        entry["consequence"] = c.clone().detach()
 
     # ------------------------------------------------------------------ query
 

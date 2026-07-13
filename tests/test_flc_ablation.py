@@ -21,8 +21,11 @@ def test_no_future_latent_ablation_runs():
 
     for _ in range(5):
         action, info = agent.select_action(obs)
-        agent.learn_consequence(0.1, 0.0, 0.01, 0.005)
-        obs = np.random.randn(18).astype(np.float32)
+        next_obs = np.random.randn(18).astype(np.float32)
+        agent.learn_consequence(
+            0.1, 0.0, 0.01, 0.005, next_obs=next_obs
+        )
+        obs = next_obs
 
     assert action.shape == (3,)
     assert np.all(action >= -1.0) and np.all(action <= 1.0)
@@ -39,8 +42,11 @@ def test_full_olf_runs():
 
     for _ in range(5):
         action, info = agent.select_action(obs)
-        agent.learn_consequence(0.1, 0.0, 0.01, 0.005)
-        obs = np.random.randn(18).astype(np.float32)
+        next_obs = np.random.randn(18).astype(np.float32)
+        agent.learn_consequence(
+            0.1, 0.0, 0.01, 0.005, next_obs=next_obs
+        )
+        obs = next_obs
 
     assert action.shape == (3,)
     assert "verdict" in info

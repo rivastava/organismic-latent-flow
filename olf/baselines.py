@@ -42,16 +42,30 @@ class MLPBaselineAgent(nn.Module):
     def reset_state(self):
         pass
 
-    def learn_consequence(self, reward, was_lethal, hunger_delta, fatigue_delta):
+    def learn_consequence(
+        self,
+        reward,
+        was_lethal,
+        hunger_delta,
+        fatigue_delta,
+        next_obs=None,
+        store=True,
+    ):
         pass
 
     def select_action(self, obs, evaluate=False):
         device = next(self.parameters()).device
         obs_t = torch.FloatTensor(obs).to(device).unsqueeze(0)
-        action = self.net(obs_t)
+        action_mean = self.net(obs_t)
+        policy_log_prob = None
+        policy_raw_sample = None
         if not evaluate:
-            noise = torch.randn_like(action) * 0.3
-            action = torch.clamp(action + noise, -1.0, 1.0)
+            distribution = torch.distributions.Normal(action_mean, 0.3)
+            policy_raw_sample = distribution.sample()
+            policy_log_prob = distribution.log_prob(policy_raw_sample).sum(dim=-1)
+            action = torch.clamp(policy_raw_sample, -1.0, 1.0)
+        else:
+            action = action_mean
         return action.squeeze(0).cpu().detach().numpy(), {
             "mode": 0,
             "mode_probs": np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
@@ -59,6 +73,13 @@ class MLPBaselineAgent(nn.Module):
             "impasse": False,
             "risk": 0.0,
             "verdict": "release",
+            "_policy_log_prob": policy_log_prob,
+            "_policy_mean": action_mean.detach(),
+            "_policy_distribution_mean": action_mean.detach(),
+            "_policy_raw_sample": (
+                None if policy_raw_sample is None else policy_raw_sample.detach()
+            ),
+            "_policy_exploration_std": 0.0 if evaluate else 0.3,
         }
 
 
@@ -151,9 +172,6 @@ class AblatedOrganism(Organism):
             obs_t = torch.cat([obs_t, pad], dim=-1)
             agent_pos, self_state, context, entities_pos, entities_feats = self.parse_obs(obs_t)
 
-        # Snapshot s_t for honest (s_t, a_t, s_{t+1}) traces when memory is on
-        self._h_at_action = self.h.clone().detach()
-
         # Ablations: zero selected inputs
         if self.ablation_type == "no_self_state":
             self_state = torch.zeros_like(self_state)
@@ -168,33 +186,45 @@ class AblatedOrganism(Organism):
         else:
             spm_trace = self.spm.get_trace().to(device)
 
-        # 3. Flow update
-        x_flow = torch.cat([obs_t, spm_trace], dim=-1)
-        self.h = self.flow(x_flow, self.h.to(device))
+        # 3. Flow update. A consequence observation may already have been
+        # integrated by learn_consequence; consume that cached perception once.
+        prefetched = self._prefetched_obs
+        if prefetched is not None and torch.equal(obs_t, prefetched.to(device)):
+            self._prefetched_obs = None
+        else:
+            self._prefetched_obs = None
+            x_flow = torch.cat([obs_t, spm_trace], dim=-1)
+            self.h = self.flow(x_flow, self.h.to(device))
+        self._h_at_action = self.h.clone().detach()
+        self._entity_feats_at_action = entities_feats.detach().clone()
 
         # 4. Situated binding
         sigma_t = self.semantics.bind(
             spm_trace, entities_pos, entities_feats, context, self_state
         )
 
-        # 5. Movement policy
-        flat_embeds = sigma_t.reshape(1, -1)
+        # 5. Movement policy and optional FLC correction form the stochastic
+        # abstract-action mean. Sampling happens afterward so the rollout score
+        # matches the proposal that is passed to downstream control.
+        policy_sigma = sigma_t.detach()
+        flat_embeds = policy_sigma.reshape(1, -1)
         policy_inputs = torch.cat([self.h, flat_embeds], dim=-1)
-        a_move = self.movement_policy(policy_inputs)
-
-        if not evaluate:
-            decay = max(0.0, 1.0 - self.episode_count / (self.warmup_episodes * 5))
-            noise_std = self.explore_noise_min + (
-                self.explore_noise_init - self.explore_noise_min
-            ) * decay
-            noise = torch.randn_like(a_move) * noise_std
-            a_move = torch.clamp(a_move + noise, -1.0, 1.0)
-
-        a_cand_init = a_move
+        action_mean = self.movement_policy(policy_inputs)
         if self.ablation_type != "no_future_latent":
-            a_cand_init, _ = self.apply_future_control(
-                sigma_t, self_state, a_cand_init
+            action_mean, _ = self.apply_future_control(
+                policy_sigma,
+                self_state,
+                action_mean,
+                context=context,
             )
+        (
+            a_cand_init,
+            policy_log_prob,
+            policy_raw_sample,
+            exploration_std,
+            policy_distribution_mean,
+            intent_log_prob,
+        ) = self._sample_abstract_action(action_mean, evaluate=evaluate)
         consequences = self.semantics.predict_consequences(sigma_t, a_cand_init)
 
         impasse_detected = self.impasse_detector.detect()
@@ -252,7 +282,7 @@ class AblatedOrganism(Organism):
 
         # 7. Invention
         if self.ablation_type == "no_invention":
-            a_cand = a_move
+            a_cand = a_cand_init
         elif self.ablation_type == "ungated_invention" or mode[0] == 2:
             sig = sigma_t
             if self.ablation_type == "no_situation":
@@ -309,7 +339,7 @@ class AblatedOrganism(Organism):
             if self.ablation_type not in ("no_spm", "no_memory"):
                 self.spm.update(self.h)
         if self.ablation_type not in ("no_rtcm", "no_memory"):
-            self.rtcm.add_step(self.h, a_final)
+            self.rtcm.add_step(self.h, a_final, h_next=None)
         self.impasse_detector.add_step(agent_pos.squeeze(0).cpu().numpy(), a_final)
 
         self.last_sigma = sigma_t.clone().detach()
@@ -323,16 +353,67 @@ class AblatedOrganism(Organism):
             "risk": risk,
             "danger": danger,
             "verdict": veto_verdict,
+            "_policy_log_prob": policy_log_prob,
+            "_policy_mean": action_mean.detach(),
+            "_policy_distribution_mean": policy_distribution_mean,
+            "_policy_raw_sample": policy_raw_sample,
+            "_policy_exploration_std": exploration_std,
+            "_policy_exploration_intent": self._exploration_intent.detach(),
+            "_intent_log_prob": intent_log_prob,
+            "_episode_intent": (
+                None
+                if self._episode_intent is None
+                else self._episode_intent.detach()
+            ),
+            "_episode_intent_raw_sample": self._episode_intent_raw_sample,
+            "_episode_intent_distribution_mean": (
+                self._episode_intent_distribution_mean
+            ),
+            "_episode_intent_source": self._episode_intent_source,
+            "_training_h": self.h.detach(),
+            "_training_sigma": sigma_t,
+            "_training_spm_trace": spm_trace.detach(),
+            "_training_abstract_action": a_cand_init.detach(),
         }
 
-    def learn_consequence(self, reward, was_lethal, hunger_delta, fatigue_delta):
+    def learn_consequence(
+        self,
+        reward,
+        was_lethal,
+        hunger_delta,
+        fatigue_delta,
+        next_obs=None,
+        store=True,
+    ):
         # 'no_consequence_memory' / 'no_memory' disables fast-trace storage.
         if self.ablation_type in ("no_consequence_memory", "no_memory"):
-            # Still update the consequence_val for downstream consumers.
-            self.recent_consequence_val = reward - 1.0 * was_lethal
+            s_t = self._h_at_action if self._h_at_action is not None else self.h
+            s_after = self._recouple_observation(
+                next_obs,
+                s_t=s_t,
+                track_grad=bool(store and self.training),
+            )
+            consequence_vec = np.array(
+                [reward, float(was_lethal), hunger_delta, fatigue_delta],
+                dtype=np.float32,
+            )
+            if self.ablation_type != "no_memory":
+                self.rtcm.complete_last_step(consequence_vec, s_after)
+            self.recent_consequence_val = (
+                -float(hunger_delta)
+                - float(fatigue_delta)
+                - float(was_lethal)
+            )
             self.readiness_gate.update(self.h, received_consequence=True)
             return
 
         # 'soft_risk_only' now uses soft action penalty, not reward shaping.
         # We do NOT modify reward — the penalty was applied in select_action.
-        super().learn_consequence(reward, was_lethal, hunger_delta, fatigue_delta)
+        super().learn_consequence(
+            reward,
+            was_lethal,
+            hunger_delta,
+            fatigue_delta,
+            next_obs=next_obs,
+            store=store,
+        )

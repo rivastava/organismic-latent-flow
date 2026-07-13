@@ -79,6 +79,93 @@ FEATURE_FLAGS = {
 }
 
 
+TRAINING_SIGNALS = (
+    "legacy_reward",
+    "raw_reward",
+    "terminal_viability",
+    "homeostatic_delta",
+    "terminal_homeostasis",
+)
+CREDIT_MODES = ("uniform", "rtcm")
+OPTIMIZER_PROFILES = ("legacy", "policy_focused", "uniform_low")
+
+
+def _policy_learning_signal(
+    raw_reward,
+    *,
+    done,
+    was_lethal,
+    predicted_value=0.0,
+    training_signal="legacy_reward",
+    self_state=None,
+    next_self_state=None,
+):
+    """Return the scalar that trains policy and consequence pathways.
+
+    ``legacy_reward`` preserves the historical runner exactly: benchmark reward
+    plus the small predicted-value bonus. ``raw_reward`` removes that circular
+    bonus while retaining benchmark reward. ``terminal_viability`` uses only
+    terminal life/death. ``homeostatic_delta`` uses the observed deformation
+    of the body viability functional. ``terminal_homeostasis`` uses its
+    absolute terminal value. Neither homeostatic mode reads benchmark reward.
+    """
+    if training_signal not in TRAINING_SIGNALS:
+        raise ValueError(
+            f"unknown training_signal={training_signal!r}; expected one of {TRAINING_SIGNALS}"
+        )
+    if training_signal == "legacy_reward":
+        return float(raw_reward) + 0.02 * float(predicted_value)
+    if training_signal == "raw_reward":
+        return float(raw_reward)
+    if training_signal == "terminal_viability":
+        if not done:
+            return 0.0
+        return -1.0 if was_lethal else 1.0
+
+    if training_signal == "terminal_homeostasis":
+        if not done:
+            return 0.0
+        if was_lethal:
+            return -1.0
+        if next_self_state is None:
+            raise ValueError(
+                "terminal_homeostasis requires next self_state"
+            )
+        following = np.asarray(next_self_state, dtype=np.float32)
+        return float(np.clip(1.0 - following.sum(), -1.0, 1.0))
+
+    if self_state is None or next_self_state is None:
+        raise ValueError(
+            "homeostatic_delta requires current and next self_state"
+        )
+    current = np.asarray(self_state, dtype=np.float32)
+    following = np.asarray(next_self_state, dtype=np.float32)
+    current_viability = float(np.clip(1.0 - current.sum(), -1.0, 1.0))
+    next_viability = (
+        -1.0
+        if was_lethal
+        else float(np.clip(1.0 - following.sum(), -1.0, 1.0))
+    )
+    return next_viability - current_viability
+
+
+def _mean_one_credit_weights(weights, length):
+    """Return non-negative credit weights with unit mean.
+
+    Causal attribution may redistribute a policy update across time, but it
+    must not silently divide the entire update by the episode length. Invalid
+    or degenerate retrieval falls back to the unbiased uniform estimator.
+    """
+    if length <= 0 or len(weights) != length:
+        return [1.0] * max(0, length)
+    clean = [max(0.0, float(weight)) for weight in weights]
+    total = sum(clean)
+    if total <= 1e-8:
+        return [1.0] * length
+    scale = length / total
+    return [weight * scale for weight in clean]
+
+
 def set_global_seed(seed):
     """Seed Python, NumPy, and PyTorch for fully deterministic runs.
 
@@ -135,15 +222,18 @@ def _boundary_proximity_target(obs, next_obs, was_lethal):
 
 
 def _passive_boundary_target(obs):
-    """Counterfactual no-action boundary target for B_psi baseline samples."""
+    """Observed pre-action boundary pressure used as the deformation baseline.
+
+    The previous implementation inserted BaseBenchmark's exact hunger/fatigue
+    drift constants, which was both environment-specific and not a genuine
+    counterfactual. The current body state is observable to the organism and
+    provides a task-independent baseline for one-step boundary deformation.
+    """
     if obs is None or len(obs) < 4:
         return 0.0
-    passive_next = np.asarray(obs[2:4], dtype=np.float32).copy()
-    # BaseBenchmark passive drift: the body moves toward the viability boundary
-    # even when the organism does nothing.
-    passive_next[0] = np.clip(passive_next[0] + 0.02, 0.0, 1.0)
-    passive_next[1] = np.clip(passive_next[1] + 0.01, 0.0, 1.0)
-    boundary_pressure = float(np.max(passive_next))
+    boundary_pressure = float(
+        np.max(np.asarray(obs[2:4], dtype=np.float32))
+    )
     if boundary_pressure <= 0.6:
         return 0.0
     if boundary_pressure <= 0.8:
@@ -160,8 +250,10 @@ def _attributable_boundary_target(boundary_target, passive_target, was_lethal):
     drift is already risky. The target therefore labels only the risk added by
     the action relative to passive drift.
     """
-    if was_lethal:
-        return 1.0
+    # Lethality is already represented by boundary_target=1.0. Subtracting the
+    # pre-action pressure distinguishes sudden collapse from crossing a boundary
+    # that was already imminent; forcing every death to 1.0 taught B_psi that
+    # arbitrary final actions caused passive starvation.
     return max(0.0, float(boundary_target) - float(passive_target))
 
 
@@ -261,7 +353,7 @@ def _compute_counterfactual_loss(
     return total_loss / len(pairs)
 
 
-def build_training_param_groups(agent, lr):
+def build_training_param_groups(agent, lr, profile="legacy"):
     """Build optimizer groups with FLC isolated at a lower learning rate.
 
     Policy-gradient updates on continuous actions are noisy, so the movement
@@ -270,20 +362,47 @@ def build_training_param_groups(agent, lr):
     split prevents future-latent parameters from destabilizing the policy while
     preserving the forward FLC path and trainability.
     """
+    if profile not in OPTIMIZER_PROFILES:
+        raise ValueError(
+            f"unknown optimizer profile={profile!r}; expected one of {OPTIMIZER_PROFILES}"
+        )
+    multipliers = {
+        "legacy": (0.01, 0.1, 0.001),
+        "policy_focused": (0.1, 0.01, 0.001),
+        "uniform_low": (0.01, 0.01, 0.001),
+    }
+    policy_multiplier, other_multiplier, flc_multiplier = multipliers[profile]
+
     flc_param_ids = (
         {id(p) for p in agent.flc.parameters()}
         if hasattr(agent, "flc")
         else set()
     )
+    grounded_inverse_param_ids = (
+        {
+            id(parameter)
+            for module in (
+                agent.flc.grounded_transfer,
+                agent.flc.grounded_motor_projection,
+            )
+            for parameter in module.parameters()
+        }
+        if hasattr(agent, "flc")
+        and hasattr(agent.flc, "grounded_transfer")
+        else set()
+    )
 
     policy_params = []
     flc_params = []
+    grounded_inverse_params = []
     other_params = []
     for name, p in agent.named_parameters():
         if not p.requires_grad:
             continue
         if "movement_policy" in name:
             policy_params.append(p)
+        elif id(p) in grounded_inverse_param_ids:
+            grounded_inverse_params.append(p)
         elif id(p) in flc_param_ids:
             flc_params.append(p)
         else:
@@ -291,23 +410,97 @@ def build_training_param_groups(agent, lr):
 
     groups = []
     if policy_params:
-        groups.append({"params": policy_params, "lr": lr * 0.01})
+        groups.append({"params": policy_params, "lr": lr * policy_multiplier})
     if other_params:
-        groups.append({"params": other_params, "lr": lr * 0.1})
+        groups.append({"params": other_params, "lr": lr * other_multiplier})
+    if grounded_inverse_params:
+        # This path is owned by supervised event-transition reconstruction,
+        # not the high-variance policy gradient that forced the generative FLC
+        # field onto its much slower learning rate.
+        groups.append(
+            {"params": grounded_inverse_params, "lr": lr * other_multiplier}
+        )
     if flc_params:
         # Evidence from target_threat gradient ablation used lr * 0.001 for
         # FLC. This is 100x lower than the general organism group.
-        groups.append({"params": flc_params, "lr": lr * 0.001})
+        groups.append({"params": flc_params, "lr": lr * flc_multiplier})
     return groups
 
 
-def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_type="agent"):
+def _score_function_policy_loss(
+    step_log_probs,
+    advantages,
+    *,
+    blame_weights=None,
+    intent_log_prob=None,
+    intent_scores=None,
+):
+    """Compose exact step- and episode-level score-function terms.
+
+    A persistent intent is sampled once before the episode unfolds, so its
+    score receives the return-to-go from that first decision exactly once.
+    Conditional action proposals remain scored at every step. RTCM weights,
+    when explicitly enabled, localize only those per-step proposals; they do
+    not alter the causal scope of the episode-level latent variable.
     """
-    Trains the OLF agent (or ablation/MLP baseline) using Policy Gradients
-    augmented with triadic consequence updates and RTCM retrograde causal credit attribution.
+    if len(step_log_probs) != len(advantages):
+        raise ValueError("step scores and advantages must have equal length")
+    if blame_weights is None:
+        blame_weights = [1.0] * len(step_log_probs)
+    if len(blame_weights) != len(step_log_probs):
+        raise ValueError("blame weights and step scores must have equal length")
+
+    loss = advantages.new_zeros(())
+    for log_prob, advantage, causal_weight in zip(
+        step_log_probs, advantages, blame_weights, strict=True
+    ):
+        loss = loss - log_prob.sum() * advantage * causal_weight
+    scored_intents = [] if intent_scores is None else list(intent_scores)
+    if intent_log_prob is not None:
+        scored_intents.append((0, intent_log_prob))
+    for start_index, score in scored_intents:
+        if not 0 <= start_index < len(advantages):
+            raise ValueError("intent score start is outside the episode")
+        loss = loss - score.sum() * advantages[start_index]
+    return loss
+
+
+def train_agent(
+    agent,
+    task_name,
+    num_episodes=300,
+    lr=0.01,
+    seed=None,
+    agent_type="agent",
+    training_signal="legacy_reward",
+    credit_mode="uniform",
+    optimizer_profile="legacy",
+):
     """
+    Train OLF or a baseline from exact rollout policy scores.
+
+    ``credit_mode="uniform"`` is the research default until RTCM attribution
+    passes a causal localization test. ``credit_mode="rtcm"`` retains the
+    experimental retrograde reweighting as an explicit ablation.
+    """
+    if training_signal not in TRAINING_SIGNALS:
+        raise ValueError(
+            f"unknown training_signal={training_signal!r}; expected one of {TRAINING_SIGNALS}"
+        )
+    if credit_mode not in CREDIT_MODES:
+        raise ValueError(
+            f"unknown credit_mode={credit_mode!r}; expected one of {CREDIT_MODES}"
+        )
+    if optimizer_profile not in OPTIMIZER_PROFILES:
+        raise ValueError(
+            f"unknown optimizer_profile={optimizer_profile!r}; "
+            f"expected one of {OPTIMIZER_PROFILES}"
+        )
     set_global_seed(seed)
     agent.to(device)
+    agent.train()
+    agent._training_signal = training_signal
+    agent._credit_mode = credit_mode
     # Decoupled optimizers: the policy head needs a much smaller learning
     # rate than the rest of the organism, because policy gradients on
     # continuous actions are high-variance and easily destroy good behavior.
@@ -315,7 +508,9 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
     # outputs feed into the policy input — even small changes there shift
     # the policy output. This is constitutional — we still learn everything
     # end-to-end, but at appropriate rates.
-    optimizer = optim.Adam(build_training_param_groups(agent, lr))
+    optimizer = optim.Adam(
+        build_training_param_groups(agent, lr, profile=optimizer_profile)
+    )
     bpsi_enabled = (
         hasattr(agent, "veto")
         and not hasattr(agent, "net")
@@ -330,7 +525,6 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
     )
     if bpsi_enabled:
         agent._bpsi_training_stats = []
-
     EnvClass = ENV_MAP[task_name]
     env = EnvClass(seed=seed)
 
@@ -362,6 +556,16 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
         episode_dones = []
         episode_infos = []
         episode_self_states = []
+        episode_policy_log_probs = []
+        episode_intent_scores = []
+        episode_training_sigmas = []
+        episode_training_latents = []
+        episode_training_abstract_actions = []
+        episode_post_latents = []
+        episode_spm_traces = []
+        episode_entity_event_masks = []
+        episode_observed_effects = []
+        episode_homeostatic_deltas = []
         # v0.3.2.11: self-supervised boundary targets for B_psi.
         episode_boundary_targets = []
         episode_zero_boundary_targets = []
@@ -375,38 +579,66 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
             
             # Step forward
             action, info_dict = agent.select_action(obs)
+            policy_log_prob = info_dict.get("_policy_log_prob")
+            if policy_log_prob is None:
+                raise RuntimeError(
+                    "training action did not expose its rollout log-probability"
+                )
+            episode_policy_log_probs.append(policy_log_prob)
+            intent_log_prob = info_dict.get("_intent_log_prob")
+            if intent_log_prob is not None:
+                episode_intent_scores.append(
+                    (len(episode_policy_log_probs) - 1, intent_log_prob)
+                )
+            if not hasattr(agent, "net"):
+                episode_training_sigmas.append(info_dict["_training_sigma"])
+                episode_training_latents.append(info_dict["_training_h"])
+                episode_spm_traces.append(info_dict["_training_spm_trace"])
+                episode_training_abstract_actions.append(
+                    info_dict["_training_abstract_action"]
+                )
             
             # Step environment
             next_obs, reward, done, info = env.step(action)
-            
             episode_actions.append(action.copy())
             episode_raw_rewards.append(reward)
             
-            # Internal consequence-driven reward shaping (Constitution §7, §19 compliant)
-            # Instead of external distance-based shaping, use the organism's own
-            # consequence predictions as an intrinsic motivation signal.
-            # This keeps reward shaping within the organismic loop.
-            intrinsic_bonus = 0.0
-            if hasattr(agent, 'semantics') and hasattr(info_dict, '__getitem__'):
+            # Historical behavior is retained only under ``legacy_reward``.
+            # The explicit terminal_viability mode below never reads benchmark
+            # reward or the semantics value head as a learning signal.
+            predicted_value = 0.0
+            if training_signal == "legacy_reward" and hasattr(agent, 'semantics'):
                 cons = info_dict.get("consequences", None)
                 if cons is not None and "value" in cons:
-                    # Small bonus from the organism's own predicted value
-                    # This decays naturally as the predictor learns real consequences
-                    pred_val = cons["value"].mean().item()
-                    intrinsic_bonus = 0.02 * pred_val
-            
-            shaped_reward = reward + intrinsic_bonus
-            episode_rewards.append(shaped_reward)
+                    predicted_value = cons["value"].mean().item()
+
+            was_lethal = 1.0 if info["status"] in ["death", "starvation"] else 0.0
+            learning_signal = _policy_learning_signal(
+                reward,
+                done=done,
+                was_lethal=was_lethal,
+                predicted_value=predicted_value,
+                training_signal=training_signal,
+                self_state=obs[2:4],
+                next_self_state=next_obs[2:4],
+            )
+            consequence_signal = (
+                float(reward)
+                if training_signal in ("legacy_reward", "raw_reward")
+                else learning_signal
+            )
+            episode_rewards.append(learning_signal)
             episode_dones.append(done)
             episode_infos.append(info)
             episode_self_states.append(obs[2:4].copy())
             
             # Consequence feedback to the fast/slow memory trace
-            was_lethal = 1.0 if info["status"] in ["death", "starvation"] else 0.0
-            
             # Calculate changes in homeostatic self state
             hunger_delta = next_obs[2] - obs[2]
             fatigue_delta = next_obs[3] - obs[3]
+            episode_homeostatic_deltas.append(
+                (float(hunger_delta), float(fatigue_delta))
+            )
 
             # v0.3.2.11: boundary proximity provides a continuous signal before
             # actual death. The paired zero-action target teaches B_psi the
@@ -416,30 +648,56 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
             )
             episode_zero_boundary_targets.append(_passive_boundary_target(obs))
             
-            agent.learn_consequence(reward, was_lethal, hunger_delta, fatigue_delta)
+            agent.learn_consequence(
+                consequence_signal,
+                was_lethal,
+                hunger_delta,
+                fatigue_delta,
+                next_obs=next_obs,
+            )
+            if not hasattr(agent, "net"):
+                episode_entity_event_masks.append(
+                    agent.last_entity_event_mask.detach().clone()
+                )
+                episode_observed_effects.append(
+                    agent.last_observed_effect.detach().clone()
+                )
+                episode_post_latents.append(agent.h.detach().clone())
             
             obs = next_obs
             
         # 1. Compute return G_t for policy gradient calculation
         returns = []
         G = 0.0
+        return_gamma = (
+            1.0
+            if training_signal in ("homeostatic_delta", "terminal_homeostasis")
+            else 0.95
+        )
         for r in reversed(episode_rewards):
-            G = r + 0.95 * G
+            G = r + return_gamma * G
             returns.insert(0, G)
         returns = torch.FloatTensor(returns).to(device)
 
-        # Update running-mean baseline. Use the sum of episode raw rewards
-        # (not discounted return) so the baseline tracks "average episode
-        # outcome", which is what we want to center the policy gradient around.
-        ep_total = sum(episode_raw_rewards)
+        # The baseline must be independent of the current episode's actions.
+        # Use prior episodes only, then append this episode after advantages are
+        # fixed. Including the current return biases the score estimator.
+        running_mean = (
+            sum(_return_history) / len(_return_history)
+            if _return_history
+            else 0.0
+        )
+        baseline = torch.tensor(running_mean, device=device)
+        advantages = returns - baseline
+
+        ep_total = (
+            sum(episode_raw_rewards)
+            if training_signal in ("legacy_reward", "raw_reward")
+            else sum(episode_rewards)
+        )
         _return_history.append(ep_total)
         if len(_return_history) > _baseline_window:
             _return_history.pop(0)
-        # Running mean: average of recent episode returns.
-        running_mean = sum(_return_history) / len(_return_history)
-        # Per-episode baseline for this episode.
-        baseline = torch.tensor(running_mean, device=device)
-        advantages = returns - baseline
 
         # 2. Retrieve RTCM retrograde causal blame if a delayed reward or hazard occurs
         # The consequence vector: [final_reward, was_lethal, hunger_delta, fatigue_delta]
@@ -449,13 +707,13 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
 
         consequence_vec = torch.FloatTensor([[final_reward, final_was_lethal, 0.0, 0.0]]).to(device)
 
-        # Retrograde blame weights: scale gradient updates of historical steps based on causal blame
-        if hasattr(agent, 'rtcm'):
+        # RTCM credit remains an explicit ablation until its localization is
+        # empirically validated. Uniform credit is the unbiased default.
+        blame_weights = [1.0] * len(episode_obs)
+        if credit_mode == "rtcm" and hasattr(agent, "rtcm"):
             blame_weights = agent.rtcm.retrieve_causal_blame(consequence_vec)
             if not blame_weights:
                 blame_weights = [1.0] * len(episode_obs)
-        else:
-            blame_weights = [1.0] * len(episode_obs)
 
         # v3: blend in RTCM delayed-credit blame (top-k softmax retrieval).
         # The delayed-credit weights point at the top-k past steps most likely
@@ -463,7 +721,7 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
         # existing per-step blame so the organism still uses per-step signal
         # but adds delayed causal retrieval. If RTCM returns nothing, the
         # blend leaves the original blame untouched.
-        if hasattr(agent, 'rtcm') and not (
+        if credit_mode == "rtcm" and hasattr(agent, "rtcm") and not (
             hasattr(agent, "ablation_type") and agent.ablation_type == "no_rtcm"
         ):
             delayed = agent.rtcm.retrieve_delayed_credit(
@@ -509,197 +767,287 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
             #                 for b, t in zip(blame_weights, ta_full)
             #             ]
 
-        # 3. Optimize parameters
+        blame_weights = _mean_one_credit_weights(
+            blame_weights, len(episode_obs)
+        )
+
+        # 3. Optimize the exact stochastic proposals recorded during rollout.
+        # The previous implementation reset the organism and treated the final
+        # motor action as a Normal sample around a second, different latent
+        # trajectory. Besides being off-policy, that reset erased RTCM history
+        # before its learning step. The score-function estimator belongs to the
+        # sampled abstract proposal; boundary and motor transformations are
+        # deterministic downstream control.
         optimizer.zero_grad()
-        agent.reset_state()
-        
-        policy_loss = 0.0
-        consequence_loss = 0.0
-        
-        if hasattr(agent, 'net'):
-            # MLP agent training loop
-            for idx in range(len(episode_obs)):
-                obs_step = episode_obs[idx]
-                act_taken = torch.FloatTensor(episode_actions[idx]).to(device).unsqueeze(0)
-                adv = advantages[idx]
-                obs_t = torch.FloatTensor(obs_step).to(device).unsqueeze(0)
+        policy_loss = _score_function_policy_loss(
+            episode_policy_log_probs,
+            advantages,
+            blame_weights=(
+                blame_weights if not hasattr(agent, "net") else None
+            ),
+            intent_scores=episode_intent_scores,
+        )
 
-                pred_act = agent.net(obs_t)
-                dist_dx = torch.distributions.Normal(pred_act[:, 0], 0.1)
-                dist_dy = torch.distributions.Normal(pred_act[:, 1], 0.1)
-                dist_u = torch.distributions.Normal(pred_act[:, 2], 0.1)
-                log_prob = dist_dx.log_prob(act_taken[:, 0]) + dist_dy.log_prob(act_taken[:, 1]) + dist_u.log_prob(act_taken[:, 2])
-                policy_loss += -log_prob.sum() * adv
-        else:
-            # OLF Agent training loop
-            for idx in range(len(episode_obs)):
-                obs_step = episode_obs[idx]
-                act_taken = torch.FloatTensor(episode_actions[idx]).to(device).unsqueeze(0)
-                adv = advantages[idx]
-                causal_weight = blame_weights[idx] if idx < len(blame_weights) else 1.0
-                obs_t = torch.FloatTensor(obs_step).to(device).unsqueeze(0)
+        consequence_loss = torch.zeros((), device=device)
+        consequence_event_terms = 0
+        if not hasattr(agent, "net"):
+            if not (
+                len(episode_training_sigmas)
+                == len(episode_training_latents)
+                == len(episode_training_abstract_actions)
+                == len(episode_spm_traces)
+                == len(episode_entity_event_masks)
+                == len(episode_observed_effects)
+                == len(episode_post_latents)
+                == len(episode_obs)
+            ):
+                raise RuntimeError("incomplete OLF rollout training trace")
 
-                # Parse observations (organism.parse_obs now returns 5 values)
-                if obs_t.shape[-1] == agent.obs_dim:
-                    agent_pos, self_state, context, entities_pos, entities_feats = agent.parse_obs(obs_t)
-                else:
-                    pad = torch.zeros(1, agent.obs_dim - obs_t.shape[-1], device=device)
-                    obs_t = torch.cat([obs_t, pad], dim=-1)
-                    agent_pos, self_state, context, entities_pos, entities_feats = agent.parse_obs(obs_t)
+            for idx, sigma_t in enumerate(episode_training_sigmas):
+                act_taken = torch.as_tensor(
+                    episode_actions[idx], dtype=torch.float32, device=device
+                ).unsqueeze(0)
 
-                # Retrieve trace
-                if hasattr(agent, 'spm'):
-                    spm_trace = agent.spm.get_trace().to(device)
-                else:
-                    spm_trace = torch.zeros(1, agent.latent_dim, device=device)
-
-                # Update latent flow proposal
-                x_flow = torch.cat([obs_t, spm_trace], dim=-1)
-                agent.h = agent.flow(x_flow, agent.h)
-
-                # entities_pos and entities_feats already come from parse_obs.
-
-                # Bind situated representation
-                sigma_t = agent.semantics.bind(spm_trace, entities_pos, entities_feats, context, self_state)
-
-                # REINFORCE update for movement policy network
-                if hasattr(agent, 'movement_policy'):
-                    flat_embeds = sigma_t.reshape(1, -1)
-                    policy_inputs = torch.cat([agent.h, flat_embeds], dim=-1)
-                    pred_move = agent.movement_policy(policy_inputs)
-                    if hasattr(agent, "apply_future_control"):
-                        pred_move, _ = agent.apply_future_control(
-                            sigma_t, self_state, pred_move
+                event_mask = episode_entity_event_masks[idx]
+                if bool(event_mask.any()):
+                    was_lethal_step = float(
+                        episode_infos[idx]["status"] in ("death", "starvation")
+                    )
+                    consequences_pred = agent.semantics.predict_consequences(
+                        sigma_t, act_taken
+                    )
+                    target_effect = episode_observed_effects[idx].squeeze(0)
+                    # Meaning is prospective: an event is valued by the
+                    # endogenous viability that unfolds after it, not merely
+                    # its immediate body delta. This makes delayed lure and
+                    # safe-exit consequences distinguishable without task labels.
+                    target_value = returns[idx].detach().reshape(1)
+                    target_risk = torch.tensor(
+                        [was_lethal_step], device=device
+                    )
+                    hunger_delta, fatigue_delta = episode_homeostatic_deltas[idx]
+                    target_reversibility = torch.tensor(
+                        [
+                            float(
+                                not was_lethal_step
+                                and hunger_delta + fatigue_delta < 0.0
+                            )
+                        ],
+                        device=device,
+                    )
+                    for ent_idx in torch.nonzero(
+                        event_mask, as_tuple=False
+                    ).flatten().tolist():
+                        pred_effect = consequences_pred["dh_pred"][0, ent_idx]
+                        pred_value = consequences_pred["value"][0, ent_idx]
+                        pred_risk = consequences_pred["terminal_risk"][0, ent_idx]
+                        pred_reversibility = consequences_pred["reversibility"][
+                            0, ent_idx
+                        ]
+                        pred_uncertainty = consequences_pred["uncertainty"][
+                            0, ent_idx
+                        ]
+                        effect_loss = nn.functional.mse_loss(
+                            pred_effect, target_effect
                         )
-
-                    # Non-finite diagnostics: if any policy output is non-finite,
-                    # crash loudly with full context so the source is identifiable.
-                    # Do NOT silently continue: non-finite policy outputs indicate
-                    # a real numerical instability that must be diagnosed.
-                    if not torch.isfinite(pred_move).all():
-                        _ctx = {
-                            "task": task_name,
-                            "seed": seed,
-                            "agent_type": agent_type,
-                            "ablation_type": getattr(agent, "ablation_type", None),
-                            "episode": episode,
-                            "step": idx,
-                            "h": _tensor_health(agent.h),
-                            "spm_trace": _tensor_health(spm_trace),
-                            "sigma_t": _tensor_health(sigma_t),
-                            "policy_inputs": _tensor_health(policy_inputs),
-                            "pred_move_health": _tensor_health(pred_move),
-                            "pred_move": pred_move.detach().tolist(),
-                        }
-                        raise RuntimeError(
-                            f"[non-finite diagnostics] Non-finite pred_move at "
-                            f"episode={episode} step={idx}  {_ctx}"
+                        value_loss = nn.functional.mse_loss(
+                            pred_value, target_value
                         )
+                        risk_loss = nn.functional.binary_cross_entropy(
+                            pred_risk, target_risk
+                        )
+                        reversibility_loss = nn.functional.binary_cross_entropy(
+                            pred_reversibility, target_reversibility
+                        )
+                        with torch.no_grad():
+                            uncertainty_target = torch.clamp(
+                                effect_loss.detach()
+                                + value_loss.detach()
+                                + risk_loss.detach(),
+                                0.0,
+                                1.0,
+                            ).reshape_as(pred_uncertainty)
+                        uncertainty_loss = nn.functional.mse_loss(
+                            pred_uncertainty, uncertainty_target
+                        )
+                        consequence_loss = consequence_loss + (
+                            effect_loss
+                            + value_loss
+                            + risk_loss
+                            + 0.1 * reversibility_loss
+                            + 0.1 * uncertainty_loss
+                        )
+                        consequence_event_terms += 1
 
-                    # 3-dim policy: dx, dy, u (use action).
-                    # Continuous Normal likelihood for variance reduction even on the
-                    # binary use action.
-                    dist_dx = torch.distributions.Normal(pred_move[:, 0], 0.1)
-                    dist_dy = torch.distributions.Normal(pred_move[:, 1], 0.1)
-                    dist_u = torch.distributions.Normal(pred_move[:, 2], 0.1)
-                    log_prob = (dist_dx.log_prob(act_taken[:, 0])
-                                + dist_dy.log_prob(act_taken[:, 1])
-                                + dist_u.log_prob(act_taken[:, 2]))
-
-                    # Scale policy gradient loss by the causal blame weight from RTCM
-                    # Use advantage (centered return) instead of raw return for variance reduction.
-                    policy_loss += -log_prob.sum() * adv * causal_weight
-                    
-                    # Train semantics consequence predictions
-                    # SCALED DOWN: most episodes end with reward=0, so training the
-                    # semantics to "predict 0" drowns out the policy gradient with
-                    # gradients that are misaligned with the actual task. We only
-                    # train the consequence predictor on the last step of the
-                    # episode (where reward/lethality carry actual signal) and at
-                    # a small weight to avoid overwhelming the policy gradient.
-                    if idx == len(episode_obs) - 1:
-                        next_info = episode_infos[idx]
-                        was_lethal_step = 1.0 if next_info["status"] in ["death", "starvation"] else 0.0
-                        reward_val = episode_rewards[idx]
-
-                        for ent_idx in range(entities_pos.size(1)):
-                            ent_dist = torch.linalg.norm(entities_pos[0, ent_idx]).item()
-                            if ent_dist < 0.15:
-                                # Consequence mapping target: [reward, was_lethal, hunger_delta, fatigue_delta]
-                                target_cons = torch.FloatTensor([reward_val, was_lethal_step, 0.0, 0.0]).to(device)
-
-                                # Forward prediction
-                                consequences_pred = agent.semantics.predict_consequences(sigma_t, act_taken)
-                                consequence_loss += nn.MSELoss()(consequences_pred["value"][0, ent_idx], target_cons[0:1])
-                                consequence_loss += nn.MSELoss()(consequences_pred["terminal_risk"][0, ent_idx], target_cons[1:2])
-
-                    # v0.3.2.11: Accumulate B_psi training data on EVERY step.
-                    # B_psi learns ACTION-ATTRIBUTABLE boundary risk: how much
-                    # does this action increase risk relative to passive drift?
-                    #
-                    # Target for action sample:
-                    #   attributable_risk = max(0, proximity_with_action - proximity_passive)
-                    #   This is > 0 only when the action makes things worse than doing nothing.
-                    #   Death always has attributable_risk = 1.0.
-                    #
-                    # Target for zero-action sample:
-                    #   Always 0.0: zero action has zero attributable risk by definition.
-                    #
-                    # At inference: danger = B_psi(a) - B_psi(0) ~= B_psi(a),
-                    # which is non-zero only when the action increases boundary risk.
-                    if bpsi_enabled:
-                        consequences_veto = agent.semantics.predict_consequences(sigma_t, act_taken)
+                if bpsi_enabled:
+                    with torch.no_grad():
+                        consequences_veto = agent.semantics.predict_consequences(
+                            sigma_t.detach(), act_taken
+                        )
                         dh_pred_veto = consequences_veto["dh_pred"].mean(dim=1)
-
-                        was_lethal_step = (
-                            1.0 if episode_infos[idx]["status"] in ["death", "starvation"]
-                            else 0.0
-                        )
-                        boundary_target = (
-                            episode_boundary_targets[idx]
-                            if idx < len(episode_boundary_targets) else 0.0
-                        )
-                        zero_target = (
-                            episode_zero_boundary_targets[idx]
-                            if idx < len(episode_zero_boundary_targets) else 0.0
-                        )
-
-                        # Compute attributable risk: how much worse is the action
-                        # compared to passive drift?
-                        attributable_risk = _attributable_boundary_target(
-                            boundary_target, zero_target, was_lethal_step
-                        )
-
-                        action_weight = 1.0
-                        if was_lethal_step:
-                            action_weight = 12.0
-                        elif attributable_risk > 0.05:
-                            action_weight = 4.0
-
-                        episode_bpsi_data.append((
-                            agent.h.clone().detach(),
-                            act_taken.clone().detach(),
-                            dh_pred_veto.clone().detach(),
-                            torch.tensor([[attributable_risk]], device=device),
-                            torch.tensor([[action_weight]], device=device),
-                        ))
-
-                        # Zero-action sample: target is always 0.0
                         a_zero = torch.zeros_like(act_taken)
-                        consequences_zero = agent.semantics.predict_consequences(sigma_t, a_zero)
+                        consequences_zero = agent.semantics.predict_consequences(
+                            sigma_t.detach(), a_zero
+                        )
                         dh_pred_zero = consequences_zero["dh_pred"].mean(dim=1)
-                        episode_bpsi_data.append((
-                            agent.h.clone().detach(),
-                            a_zero.clone().detach(),
-                            dh_pred_zero.clone().detach(),
-                            torch.tensor([[0.0]], device=device),
-                            torch.tensor([[1.0]], device=device),
-                        ))
 
-                    # Update SPM trace buffer during training replay (Constitution compliance)
-                    if hasattr(agent, 'spm'):
-                        if not (hasattr(agent, 'ablation_type') and agent.ablation_type == 'no_diagnostic_decay'):
-                            agent.spm.update(agent.h)
+                    was_lethal_step = float(
+                        episode_infos[idx]["status"] in ("death", "starvation")
+                    )
+                    boundary_target = episode_boundary_targets[idx]
+                    zero_target = episode_zero_boundary_targets[idx]
+                    attributable_risk = _attributable_boundary_target(
+                        boundary_target, zero_target, was_lethal_step
+                    )
+                    action_weight = (
+                        12.0
+                        if was_lethal_step
+                        else (4.0 if attributable_risk > 0.05 else 1.0)
+                    )
+                    h_t = episode_training_latents[idx]
+                    episode_bpsi_data.extend(
+                        [
+                            (
+                                h_t,
+                                act_taken.detach(),
+                                dh_pred_veto.detach(),
+                                torch.tensor(
+                                    [[attributable_risk]], device=device
+                                ),
+                                torch.tensor([[action_weight]], device=device),
+                            ),
+                            (
+                                h_t,
+                                a_zero.detach(),
+                                dh_pred_zero.detach(),
+                                torch.tensor([[0.0]], device=device),
+                                torch.tensor([[1.0]], device=device),
+                            ),
+                        ]
+                    )
+
+        prospective_event_losses = []
+        prospective_inverse_losses = []
+        if not hasattr(agent, "net") and getattr(
+            agent, "use_prospective_event_grounding", False
+        ):
+            max_horizon = agent.prospective_event_field.max_horizon
+            for event_idx, event_mask in enumerate(
+                episode_entity_event_masks
+            ):
+                if not bool(event_mask.any()):
+                    continue
+                start_idx = max(0, event_idx + 1 - max_horizon)
+                event_loss = agent.prospective_event_field.event_loss(
+                    latents=torch.cat(
+                        episode_training_latents[start_idx : event_idx + 1],
+                        dim=0,
+                    ),
+                    sigmas=torch.cat(
+                        episode_training_sigmas[start_idx : event_idx + 1],
+                        dim=0,
+                    ).detach(),
+                    actions=torch.cat(
+                        episode_training_abstract_actions[
+                            start_idx : event_idx + 1
+                        ],
+                        dim=0,
+                    ),
+                    effects=torch.cat(
+                        episode_observed_effects[start_idx : event_idx + 1],
+                        dim=0,
+                    ),
+                    endpoint=episode_post_latents[event_idx],
+                    entity_mask=event_mask,
+                    future_value=returns[event_idx].detach(),
+                    lethal=float(
+                        episode_infos[event_idx]["status"]
+                        in ("death", "starvation")
+                    ),
+                )
+                if event_loss is not None:
+                    prospective_event_losses.append(event_loss)
+                    event_latents = torch.cat(
+                        episode_training_latents[
+                            start_idx : event_idx + 1
+                        ],
+                        dim=0,
+                    )
+                    event_effects = torch.cat(
+                        episode_observed_effects[
+                            start_idx : event_idx + 1
+                        ],
+                        dim=0,
+                    )
+                    endpoint = episode_post_latents[event_idx]
+                    inverse_weights = (
+                        agent.prospective_event_field.eligibility_weights(
+                            event_latents,
+                            event_effects,
+                            endpoint,
+                        ).detach()
+                    )
+                    event_sigmas = torch.cat(
+                        episode_training_sigmas[
+                            start_idx : event_idx + 1
+                        ],
+                        dim=0,
+                    ).detach()
+                    event_self_state = torch.as_tensor(
+                        np.stack(
+                            episode_self_states[
+                                start_idx : event_idx + 1
+                            ]
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    prospective_inverse_losses.append(
+                        agent.flc.grounded_inverse_loss(
+                            current_latents=event_latents,
+                            target_future=endpoint.expand_as(event_latents),
+                            sigma_flat=event_sigmas.reshape(
+                                event_sigmas.shape[0], -1
+                            ),
+                            self_state=event_self_state,
+                            target_actions=torch.cat(
+                                episode_training_abstract_actions[
+                                    start_idx : event_idx + 1
+                                ],
+                                dim=0,
+                            ),
+                            weights=inverse_weights,
+                        )
+                    )
+                    path_length = event_idx + 1 - start_idx
+                    sample_count = min(8, path_length)
+                    sampled_offsets = torch.linspace(
+                        0,
+                        path_length - 1,
+                        steps=sample_count,
+                    ).round().long().unique().tolist()
+                    event_entities = torch.nonzero(
+                        event_mask, as_tuple=False
+                    ).flatten().tolist()
+                    event_risk = float(
+                        episode_infos[event_idx]["status"]
+                        in ("death", "starvation")
+                    )
+                    for offset in sampled_offsets:
+                        trace_idx = start_idx + int(offset)
+                        for entity_index in event_entities:
+                            agent.prospective_event_memory.add(
+                                observation=episode_obs[trace_idx],
+                                spm_trace=episode_spm_traces[trace_idx],
+                                entity_index=entity_index,
+                                endpoint=episode_post_latents[event_idx],
+                                future_value=float(returns[event_idx].item()),
+                                risk=event_risk,
+                                action=episode_training_abstract_actions[
+                                    trace_idx
+                                ],
+                                horizon=event_idx - trace_idx + 1,
+                            )
 
         # v3: empirical counterfactual loss for FiLM self-state modulation.
         # Find pairs of steps in the same episode where:
@@ -714,8 +1062,15 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
         total_loss = policy_loss
         if FEATURE_FLAGS["counterfactual_loss"] > 0.0:
             cf_loss = _compute_counterfactual_loss(
-                agent, episode_obs, episode_actions,
-                episode_self_states, episode_raw_rewards
+                agent,
+                episode_obs,
+                episode_actions,
+                episode_self_states,
+                (
+                    episode_raw_rewards
+                    if training_signal in ("legacy_reward", "raw_reward")
+                    else episode_rewards
+                ),
             )
             if cf_loss is not None and cf_loss.requires_grad:
                 total_loss = (
@@ -723,13 +1078,22 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
                     + FEATURE_FLAGS["counterfactual_loss"] * cf_loss
                 )
 
-        # Auxiliary losses are scaled down (0.01) to avoid overwhelming the
-        # policy gradient. The semantics is still being trained, but at a
-        # smaller weight so it doesn't dominate the optimizer.
+        # Sparse observation-transition events ground the consequence model.
+        # Unlike the old all-zero/coordinate-contact targets, these updates only
+        # occur when entity content actually changes.
         # v0.3.2.10: B_psi is NO LONGER trained in the main loss.
         # It gets a dedicated training step below (like RTCM).
-        if consequence_loss > 0:
-            total_loss = total_loss + 0.01 * consequence_loss
+        if consequence_event_terms > 0:
+            consequence_loss = consequence_loss / consequence_event_terms
+            total_loss = total_loss + consequence_loss
+        if prospective_event_losses:
+            total_loss = total_loss + torch.stack(
+                prospective_event_losses
+            ).mean()
+        if prospective_inverse_losses:
+            total_loss = total_loss + torch.stack(
+                prospective_inverse_losses
+            ).mean()
             
         if isinstance(total_loss, torch.Tensor):
             total_loss.backward()
@@ -780,15 +1144,11 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
         ):
             agent.rtcm.train_step(lr=1e-3)
 
-        # Constitution §4: slow plasticity of the flow field via ConsequenceMemory.
-        # Uses stored (s_t, a_t, s_{t+1}) transitions to gently deform the LTC
-        # flow proposal toward observed trajectories. lr is intentionally tiny
-        # (≪ main learning rate) so fast trace memory remains dominant.
-        if hasattr(agent, "consequence_memory") and hasattr(agent, "flow") and not (
-            hasattr(agent, "ablation_type")
-            and agent.ablation_type in ("no_memory", "no_consequence_memory")
-        ):
-            agent.consequence_memory.consolidate(agent.flow, lr=1e-3)
+        # Slow flow consolidation is intentionally not called here. Its current
+        # target is the flow network's own detached output and its input is a
+        # synthetic zero observation, making the update circular and unrelated
+        # to the transition that occurred. Flow now receives policy gradients
+        # through the actual differentiable recoupling path instead.
 
         # Log episode metrics for learning curves (Constitution §17)
         final_info = episode_infos[-1]
@@ -824,12 +1184,17 @@ def train_agent(agent, task_name, num_episodes=300, lr=0.01, seed=None, agent_ty
             
     return agent
 
-def evaluate_agent(agent, task_name, num_episodes=50, seed=None):
+def evaluate_agent(
+    agent, task_name, num_episodes=50, seed=None, training_signal=None
+):
     """
     Evaluates agent on the specified task and logs metrics.
     """
     set_global_seed(seed)
     agent.eval()
+    signal_mode = training_signal or getattr(
+        agent, "_training_signal", "legacy_reward"
+    )
     EnvClass = ENV_MAP[task_name]
     env = EnvClass(seed=seed)
     tracker = MetricTracker()
@@ -856,7 +1221,26 @@ def evaluate_agent(agent, task_name, num_episodes=50, seed=None):
             was_lethal = 1.0 if info["status"] in ["death", "starvation"] else 0.0
             hunger_delta = next_obs[2] - obs[2]
             fatigue_delta = next_obs[3] - obs[3]
-            agent.learn_consequence(reward, was_lethal, hunger_delta, fatigue_delta)
+            consequence_signal = (
+                float(reward)
+                if signal_mode in ("legacy_reward", "raw_reward")
+                else _policy_learning_signal(
+                    reward,
+                    done=done,
+                    was_lethal=was_lethal,
+                    training_signal=signal_mode,
+                    self_state=obs[2:4],
+                    next_self_state=next_obs[2:4],
+                )
+            )
+            agent.learn_consequence(
+                consequence_signal,
+                was_lethal,
+                hunger_delta,
+                fatigue_delta,
+                next_obs=next_obs,
+                store=False,
+            )
             
             obs = next_obs
             
@@ -916,11 +1300,16 @@ def run_task_experiment(task, ablations):
         "Ablations": ablation_results
     }
 
-def _evaluate_with_diagnostics(agent, task_name, seed, num_episodes=20):
+def _evaluate_with_diagnostics(
+    agent, task_name, seed, num_episodes=20, training_signal=None
+):
     """Evaluate an agent with diagnostics enabled, returning per-episode metrics."""
     set_global_seed(seed)
     agent.eval()
     agent.diag_mode = True
+    signal_mode = training_signal or getattr(
+        agent, "_training_signal", "legacy_reward"
+    )
     EnvClass = ENV_MAP[task_name]
     env = EnvClass(seed=seed)
 
@@ -943,7 +1332,26 @@ def _evaluate_with_diagnostics(agent, task_name, seed, num_episodes=20):
             was_lethal = 1.0 if info["status"] in ("death", "starvation") else 0.0
             hunger_delta = next_obs[2] - obs[2]
             fatigue_delta = next_obs[3] - obs[3]
-            agent.learn_consequence(reward, was_lethal, hunger_delta, fatigue_delta)
+            consequence_signal = (
+                float(reward)
+                if signal_mode in ("legacy_reward", "raw_reward")
+                else _policy_learning_signal(
+                    reward,
+                    done=done,
+                    was_lethal=was_lethal,
+                    training_signal=signal_mode,
+                    self_state=obs[2:4],
+                    next_self_state=next_obs[2:4],
+                )
+            )
+            agent.learn_consequence(
+                consequence_signal,
+                was_lethal,
+                hunger_delta,
+                fatigue_delta,
+                next_obs=next_obs,
+                store=False,
+            )
             obs = next_obs
 
         episodes.append({

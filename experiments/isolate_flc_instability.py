@@ -58,6 +58,8 @@ def _run_eval_episode(agent, seed):
             was_lethal,
             next_obs[2] - obs[2],
             next_obs[3] - obs[3],
+            next_obs=next_obs,
+            store=False,
         )
         steps.append({
             "danger": float(action_info.get("danger", 0.0)),

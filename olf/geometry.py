@@ -52,9 +52,13 @@ def log_map_sphere(x, y, eps=1e-8):
     Returns:
         v: (..., d) tangent vector at x such that exp_map(x, v) ≈ y.
     """
-    dot = (x * y).sum(dim=-1, keepdim=True).clamp(-1.0 + eps, 1.0 - eps)
+    dot = (x * y).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
     angle = torch.acos(dot)
     y_proj = y - x * dot
-    y_proj_norm = y_proj.norm(dim=-1, keepdim=True).clamp(min=eps)
-    v = y_proj / y_proj_norm * angle
-    return v
+    y_proj_norm = y_proj.norm(dim=-1, keepdim=True)
+    scale = torch.where(
+        y_proj_norm > eps,
+        angle / y_proj_norm.clamp(min=eps),
+        torch.zeros_like(y_proj_norm),
+    )
+    return project_to_tangent(x, y_proj * scale)

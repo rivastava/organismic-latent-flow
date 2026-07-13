@@ -72,12 +72,11 @@ class VetoBoundary(nn.Module):
         """
         Boundary-aware action refinement using B_psi risk.
 
-        The boundary refinement loop optimizes action to:
-        - Maximize predicted value (from consequence model — tells "what's good")
-        - Minimize action-attributable boundary risk from B_psi
+        The boundary refinement loop minimizes action-attributable boundary
+        risk from B_psi. Goal/value steering belongs upstream in OLF/FLC; using
+        it here made the boundary module an ungrounded second policy.
 
-        The consequence model provides value (for steering toward beneficial outcomes).
-        B_psi provides boundary risk. Steering uses only the excess over
+        Steering uses only the excess over
         the zero-action baseline so high need/baseline pressure is not
         mistaken for danger caused by the candidate action.
         These are separate signals answering different questions.
@@ -95,13 +94,9 @@ class VetoBoundary(nn.Module):
         # Set up a differentiable action reference
         a_ref = a.clone().detach().requires_grad_(True)
 
-        # Boundary refinement: optimize action to maximize value and minimize
-        # action-attributable boundary risk.
-        # Value comes from consequence model (FiLM-modulated — "what's good").
-        # Risk comes from B_psi (FiLM-independent — "what's irreversible").
+        # Boundary refinement is restricted to action-attributable risk.
         for _ in range(steps):
             consequences = semantics.predict_consequences(sigma_t, a_ref)
-            val = consequences["value"].mean()
 
             # B_psi boundary risk for this candidate action
             dh_pred = consequences["dh_pred"].mean(dim=1)
@@ -117,8 +112,7 @@ class VetoBoundary(nn.Module):
 
             attributable_risk = torch.relu(boundary_risk - baseline_risk)
 
-            # Loss: minimize -value + action-attributable boundary deformation
-            loss = -val + 2.0 * attributable_risk
+            loss = attributable_risk
 
             # Compute gradient of loss w.r.t action
             grads = torch.autograd.grad(loss, a_ref, retain_graph=True, allow_unused=True)[0]

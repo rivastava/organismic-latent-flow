@@ -16,6 +16,10 @@ from olf.motor import MotorCortex
 from olf.motor_memory import MotorMemory
 from olf.attractor import AttractorField
 from olf.salience import ProspectiveSalienceGate
+from olf.events import entity_feature_event_mask
+from olf.geometry import exponential_map, log_map_sphere, project_to_tangent
+from olf.prospective import ProspectiveEventField
+from olf.prospective_memory import ProspectiveEventMemory
 
 class Organism(nn.Module):
     """
@@ -35,13 +39,69 @@ class Organism(nn.Module):
     - §13: Diagnostic decay prevents infinite inspection
     - §14: Closure pressure from unresolved contradiction
     """
-    def __init__(self, obs_dim=18, action_dim=3, latent_dim=32, hidden_dim=64):
+    def __init__(
+        self,
+        obs_dim=18,
+        action_dim=3,
+        latent_dim=32,
+        hidden_dim=64,
+        randomize_initial_latent=False,
+        exploration_correlation=0.0,
+        exploration_intent_scale=0.0,
+        use_consequence_future_hint=True,
+        use_hierarchical_intent=False,
+        hierarchical_intent_std=1.0,
+        hierarchical_intent_blend=0.8,
+        hierarchical_babble_probability=0.0,
+        use_prospective_event_grounding=False,
+        prospective_max_horizon=64,
+        use_prospective_event_memory=True,
+        use_situated_prospective_keys=True,
+        use_prospective_action_retrieval=True,
+    ):
         super().__init__()
         
         self.obs_dim = obs_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
+        self.randomize_initial_latent = bool(randomize_initial_latent)
+        if not 0.0 <= exploration_correlation < 1.0:
+            raise ValueError("exploration_correlation must be in [0, 1)")
+        self.exploration_correlation = float(exploration_correlation)
+        if exploration_intent_scale < 0.0:
+            raise ValueError("exploration_intent_scale must be non-negative")
+        self.exploration_intent_scale = float(exploration_intent_scale)
+        self.use_consequence_future_hint = bool(use_consequence_future_hint)
+        self.use_hierarchical_intent = bool(use_hierarchical_intent)
+        if hierarchical_intent_std <= 0.0:
+            raise ValueError("hierarchical_intent_std must be positive")
+        if not 0.0 <= hierarchical_intent_blend <= 1.0:
+            raise ValueError("hierarchical_intent_blend must be in [0, 1]")
+        self.hierarchical_intent_std = float(hierarchical_intent_std)
+        self.hierarchical_intent_blend = float(hierarchical_intent_blend)
+        if not 0.0 <= hierarchical_babble_probability <= 1.0:
+            raise ValueError(
+                "hierarchical_babble_probability must be in [0, 1]"
+            )
+        self.hierarchical_babble_probability = float(
+            hierarchical_babble_probability
+        )
+        self.use_prospective_event_grounding = bool(
+            use_prospective_event_grounding
+        )
+        if prospective_max_horizon < 1:
+            raise ValueError("prospective_max_horizon must be positive")
+        self.prospective_max_horizon = int(prospective_max_horizon)
+        self.use_prospective_event_memory = bool(
+            use_prospective_event_memory
+        )
+        self.use_situated_prospective_keys = bool(
+            use_situated_prospective_keys
+        )
+        self.use_prospective_action_retrieval = bool(
+            use_prospective_action_retrieval
+        )
         self.explore_noise_init = 0.3  # Initial exploration noise std
         self.explore_noise_min = 0.05  # Minimum exploration noise
 
@@ -100,6 +160,23 @@ class Organism(nn.Module):
         # what events to write into long-term memory based on estimated
         # future causal value, not just because they happened.
         self.salience_gate = ProspectiveSalienceGate(latent_dim=latent_dim)
+        # An optional research module must not perturb the initialization of
+        # established downstream policy heads merely by existing. Forking the
+        # RNG keeps its own random initialization deterministic while restoring
+        # the organism's construction stream afterward.
+        with torch.random.fork_rng(devices=[]):
+            self.prospective_event_field = ProspectiveEventField(
+                latent_dim=latent_dim,
+                sigma_dim=hidden_dim,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+                max_horizon=self.prospective_max_horizon,
+            )
+        self.prospective_event_memory = ProspectiveEventMemory(
+            obs_dim=obs_dim,
+            latent_dim=latent_dim,
+            action_dim=action_dim,
+        )
 
         # Policy model for physical moves (dx, dy, u)
         # Constitution §6: policy emerges from the latent flow, but for the
@@ -135,6 +212,7 @@ class Organism(nn.Module):
 
         # Snapshot of h at the start of select_action (for honest s_{t+1} in trace)
         self._h_at_action = None
+        self._prefetched_obs = None
 
         # v0.3.1.2: diagnostic instrumentation. When diag_mode is True, the
         # organism records per-step telemetry into diag_buffer for the
@@ -143,6 +221,20 @@ class Organism(nn.Module):
         self.diag_mode: bool = False
         self.diag_buffer: list = []
         self.diag_episode: int = 0
+
+        # Persistent memories and learned transfer fields require one shared
+        # manifold coordinate frame. Randomizing h_0 on every episode makes the
+        # same situation start from an unrelated sphere direction. Sample one
+        # per-organism origin; keep random resets only as an explicit ablation.
+        initial_latent = torch.randn(1, latent_dim)
+        initial_latent = F.normalize(initial_latent, p=2, dim=-1)
+        self.register_buffer("initial_latent", initial_latent)
+        self.register_buffer(
+            "consequence_events_seen", torch.zeros((), dtype=torch.long)
+        )
+        self.register_buffer(
+            "prospective_events_seen", torch.zeros((), dtype=torch.long)
+        )
 
         self.reset_state()
         
@@ -255,9 +347,13 @@ class Organism(nn.Module):
 
     def reset_state(self):
         """Resets agent states, memory history, and motor controls."""
-        # Initialize h as a proper random unit vector on S^(d-1) (Constitution §2)
-        h_init = torch.randn(1, self.latent_dim)
-        self.h = h_init / (torch.linalg.norm(h_init, dim=-1, keepdim=True) + 1e-8)
+        if self.randomize_initial_latent:
+            h_init = torch.randn(
+                1, self.latent_dim, device=self.initial_latent.device
+            )
+            self.h = F.normalize(h_init, p=2, dim=-1)
+        else:
+            self.h = self.initial_latent.clone()
         self.spm.reset_memory()
         self.rtcm.reset_history()
         self.impasse_detector.reset()
@@ -276,7 +372,34 @@ class Organism(nn.Module):
         # Reset per-step caches
         self.last_sigma = None
         self.last_action = None
-        self.last_h_at_action = None  # s_t snapshot for honest (s_t, a_t, s_{t+1}) trace
+        self._h_at_action = None
+        self._prefetched_obs = None
+        self._entity_feats_at_action = None
+        self.last_entity_event_mask = torch.zeros(
+            self.num_entities, dtype=torch.bool, device=self.h.device
+        )
+        self.last_observed_effect = torch.zeros(
+            1, self.latent_dim, device=self.h.device
+        )
+        self._exploration_state = torch.zeros(
+            1, self.action_dim, device=self.h.device
+        )
+        self._exploration_initialized = False
+        self._episode_intent = None
+        self._episode_intent_raw_sample = None
+        self._episode_intent_distribution_mean = None
+        self._episode_intent_source = None
+        if self.training and self.exploration_intent_scale > 0.0:
+            intent = torch.randn(
+                1, self.action_dim, device=self.h.device
+            )
+            self._exploration_intent = F.normalize(
+                intent, p=2, dim=-1
+            ) * self.exploration_intent_scale
+        else:
+            self._exploration_intent = torch.zeros_like(
+                self._exploration_state
+            )
         self.recent_consequence_val = 0.0
 
         # The veto starts the episode with a clean slate
@@ -309,10 +432,315 @@ class Organism(nn.Module):
 
         return agent_pos, self_state, context, entities_pos, entities_feats
 
-    def apply_future_control(self, sigma_t, self_state, base_action):
-        """Apply OLF's FLC subsystem to a base action proposal."""
+    def apply_future_control(
+        self,
+        sigma_t,
+        self_state,
+        base_action,
+        context=None,
+    ):
+        """Apply FLC using a consequence-grounded future when available."""
         sigma_flat = sigma_t.reshape(base_action.shape[0], -1)
-        return self.flc(self.h, sigma_flat, self_state, base_action)
+        confidence = self._future_grounding_confidence()
+        future_hint = None
+        grounded_action_hint = None
+        action_hint_confidence = 0.0
+        if self.use_consequence_future_hint and confidence > 0.0:
+            with torch.no_grad():
+                if self.use_prospective_event_grounding:
+                    remembered = (
+                        self._read_prospective_memory(
+                            sigma_t,
+                            query_self_state=self_state,
+                            query_context=context,
+                        )
+                        if self.use_prospective_event_memory
+                        else None
+                    )
+                    if remembered is not None:
+                        prospective_value = (
+                            remembered["value"].squeeze(-1)
+                            - remembered["risk"].squeeze(-1)
+                        )
+                        support = remembered["support"]
+                        weights = torch.softmax(
+                            prospective_value
+                            + torch.log(support.clamp_min(1e-8)),
+                            dim=-1,
+                        )
+                        future_hint = F.normalize(
+                            (
+                                weights.unsqueeze(-1)
+                                * remembered["future_latent"]
+                            ).sum(dim=1),
+                            p=2,
+                            dim=-1,
+                        )
+                        if self.use_prospective_action_retrieval:
+                            grounded_action_hint = (
+                                weights.unsqueeze(-1)
+                                * remembered["action"]
+                            ).sum(dim=1)
+                        support_confidence = float(
+                            (weights * support).sum(dim=-1).mean().item()
+                        )
+                        confidence = min(confidence, support_confidence)
+                        if self.use_prospective_action_retrieval:
+                            action_hint_confidence = confidence
+                    else:
+                        prospective = self.prospective_event_field(
+                            self.h, sigma_t, base_action
+                        )
+                        prospective_value = (
+                            prospective["value"].squeeze(-1)
+                            - prospective["risk"].squeeze(-1)
+                        )
+                        weights = torch.softmax(
+                            prospective_value, dim=-1
+                        )
+                        future_hint = F.normalize(
+                            (
+                                weights.unsqueeze(-1)
+                                * prospective["future_latent"]
+                            ).sum(dim=1),
+                            p=2,
+                            dim=-1,
+                        )
+                else:
+                    consequences = self.semantics.predict_consequences(
+                        sigma_t, base_action
+                    )
+                    prospective_value = self._compute_entity_affordance(
+                        consequences
+                    )
+                    weights = torch.softmax(prospective_value, dim=-1)
+                    predicted_effect = (
+                        weights.unsqueeze(-1) * consequences["dh_pred"]
+                    ).sum(dim=1)
+                    predicted_effect = project_to_tangent(
+                        self.h, predicted_effect
+                    )
+                    future_hint = exponential_map(self.h, predicted_effect)
+        return self.flc(
+            self.h,
+            sigma_flat,
+            self_state,
+            base_action,
+            future_hint=future_hint,
+            hint_confidence=(
+                confidence if self.use_consequence_future_hint else 0.0
+            ),
+            use_grounded_inverse=self.use_prospective_event_grounding,
+            grounded_action_hint=grounded_action_hint,
+            action_hint_confidence=action_hint_confidence,
+        )
+
+    @staticmethod
+    def _situated_memory_key(sigma, self_state, context):
+        entity_count = sigma.shape[1]
+        body = F.normalize(self_state, p=2, dim=-1).unsqueeze(1).expand(
+            -1, entity_count, -1
+        )
+        situation = F.normalize(context, p=2, dim=-1).unsqueeze(1).expand(
+            -1, entity_count, -1
+        )
+        return F.normalize(
+            torch.cat(
+                [F.normalize(sigma, p=2, dim=-1), body, situation],
+                dim=-1,
+            ),
+            p=2,
+            dim=-1,
+        )
+
+    def _read_prospective_memory(
+        self,
+        query_sigma,
+        query_self_state=None,
+        query_context=None,
+    ):
+        return self._read_prospective_store(
+            self.prospective_event_memory,
+            query_sigma,
+            query_self_state=query_self_state,
+            query_context=query_context,
+        )
+
+    def _read_prospective_store(
+        self,
+        memory,
+        query_sigma,
+        *,
+        query_self_state,
+        query_context,
+    ):
+        records = memory.records()
+        if records is None:
+            return None
+        _, memory_self_state, memory_context, memory_pos, memory_feats = (
+            self.parse_obs(records["observations"])
+        )
+        memory_sigmas = self.semantics.bind(
+            records["spm_traces"],
+            memory_pos,
+            memory_feats,
+            memory_context,
+            memory_self_state,
+        )
+        rows = torch.arange(
+            memory_sigmas.shape[0], device=memory_sigmas.device
+        )
+        memory_situated_keys = self._situated_memory_key(
+            memory_sigmas, memory_self_state, memory_context
+        )
+        memory_keys = memory_situated_keys[
+            rows, records["entity_indices"]
+        ]
+        if (
+            not self.use_situated_prospective_keys
+            or query_self_state is None
+            or query_context is None
+        ):
+            query_keys = query_sigma
+            memory_keys = memory_sigmas[rows, records["entity_indices"]]
+        else:
+            query_keys = self._situated_memory_key(
+                query_sigma, query_self_state, query_context
+            )
+        return memory.read(query_keys, memory_keys)
+
+    def _sample_abstract_action(self, action_mean, evaluate=False):
+        """Sample the stochastic action proposal whose score is optimized.
+
+        Boundary refinement and motor release remain deterministic downstream
+        transformations.  The policy-gradient score therefore belongs to this
+        abstract proposal, not to the transformed motor action returned to the
+        environment.
+        """
+        intent_log_prob = None
+        hierarchical_mean = action_mean
+        if self.use_hierarchical_intent:
+            if self._episode_intent is None:
+                if evaluate:
+                    self._episode_intent = torch.clamp(
+                        action_mean.detach(), -1.0, 1.0
+                    )
+                else:
+                    babble = (
+                        self.hierarchical_babble_probability > 0.0
+                        and bool(
+                            torch.rand((), device=action_mean.device)
+                            < self.hierarchical_babble_probability
+                        )
+                    )
+                    if babble:
+                        raw_intent = torch.empty_like(action_mean).uniform_(
+                            -1.0, 1.0
+                        )
+                        self._episode_intent_source = "babble"
+                    else:
+                        intent_distribution = torch.distributions.Normal(
+                            action_mean, self.hierarchical_intent_std
+                        )
+                        raw_intent = intent_distribution.sample()
+                        intent_log_prob = intent_distribution.log_prob(
+                            raw_intent
+                        ).sum(dim=-1)
+                        self._episode_intent_source = "policy"
+                    self._episode_intent_raw_sample = raw_intent.detach()
+                    self._episode_intent_distribution_mean = (
+                        action_mean.detach()
+                    )
+                    self._episode_intent = torch.clamp(
+                        raw_intent, -1.0, 1.0
+                    ).detach()
+            blend = self.hierarchical_intent_blend
+            hierarchical_mean = (
+                (1.0 - blend) * action_mean
+                + blend * self._episode_intent
+            )
+
+        if evaluate:
+            return (
+                torch.clamp(hierarchical_mean, -1.0, 1.0),
+                None,
+                None,
+                0.0,
+                hierarchical_mean.detach(),
+                intent_log_prob,
+            )
+
+        decay = max(
+            0.0, 1.0 - self.episode_count / (self.warmup_episodes * 5)
+        )
+        noise_std = self.explore_noise_min + (
+            self.explore_noise_init - self.explore_noise_min
+        ) * decay
+        exploratory_mean = hierarchical_mean + self._exploration_intent
+        rho = self.exploration_correlation
+        if rho > 0.0 and self._exploration_initialized:
+            distribution_mean = exploratory_mean + rho * self._exploration_state
+            innovation_std = noise_std * (1.0 - rho * rho) ** 0.5
+        else:
+            distribution_mean = exploratory_mean
+            innovation_std = noise_std
+        distribution = torch.distributions.Normal(
+            distribution_mean, innovation_std
+        )
+        raw_sample = distribution.sample()
+        log_prob = distribution.log_prob(raw_sample).sum(dim=-1)
+        sampled_action = torch.clamp(raw_sample, -1.0, 1.0)
+        self._exploration_state = (raw_sample - exploratory_mean).detach()
+        self._exploration_initialized = True
+        return (
+            sampled_action,
+            log_prob,
+            raw_sample.detach(),
+            float(innovation_std),
+            distribution_mean.detach(),
+            intent_log_prob,
+        )
+
+    def renew_episode_intent(self):
+        """End the current temporal intention at an observed event boundary."""
+        self._episode_intent = None
+        self._episode_intent_raw_sample = None
+        self._episode_intent_distribution_mean = None
+        self._episode_intent_source = None
+
+    def _recouple_observation(self, next_obs, s_t=None, track_grad=True):
+        """Integrate the post-action observation exactly once.
+
+        Storage ablations may remove memories, but they must preserve this
+        perception timing or the ablation would change the organismic loop in
+        addition to the named mechanism.
+        """
+        if next_obs is None:
+            return self.h.clone().detach()
+        device = next(self.parameters()).device
+        next_obs_t = torch.as_tensor(
+            next_obs, dtype=torch.float32, device=device
+        ).reshape(1, -1)
+        if next_obs_t.shape[-1] < self.obs_dim:
+            pad = torch.zeros(1, self.obs_dim - next_obs_t.shape[-1], device=device)
+            next_obs_t = torch.cat([next_obs_t, pad], dim=-1)
+        elif next_obs_t.shape[-1] > self.obs_dim:
+            next_obs_t = next_obs_t[..., : self.obs_dim]
+
+        if getattr(self, "ablation_type", None) in ("no_spm", "no_memory"):
+            spm_trace = torch.zeros(1, self.latent_dim, device=device)
+        else:
+            spm_trace = self.spm.get_trace().to(device)
+        latent_before = self.h if s_t is None else s_t
+        x_flow = torch.cat([next_obs_t, spm_trace], dim=-1)
+        if track_grad:
+            s_after = self.flow(x_flow, latent_before.to(device))
+        else:
+            with torch.no_grad():
+                s_after = self.flow(x_flow, latent_before.to(device)).detach()
+        self.h = s_after
+        self._prefetched_obs = next_obs_t.detach().clone()
+        return s_after
 
     @staticmethod
     def _compute_entity_affordance(consequences):
@@ -329,6 +757,17 @@ class Organism(nn.Module):
         entity_uncert = consequences["uncertainty"].squeeze(-1)
         return entity_value - entity_risk - entity_uncert
 
+    def _consequence_grounding_confidence(self):
+        """Continuous evidence mass for learned consequence control."""
+        count = float(self.consequence_events_seen.item())
+        return count / (count + 10.0)
+
+    def _future_grounding_confidence(self):
+        if self.use_prospective_event_grounding:
+            count = float(self.prospective_events_seen.item())
+            return count / (count + 10.0)
+        return self._consequence_grounding_confidence()
+
     def select_action(self, obs, evaluate=False):
         """Steps the OLF organism forward through the full organismic loop."""
         device = next(self.parameters()).device
@@ -343,15 +782,20 @@ class Organism(nn.Module):
             obs_t = torch.cat([obs_t, pad], dim=-1)
             agent_pos, self_state, context, entities_pos, entities_feats = self.parse_obs(obs_t)
 
-        # Snapshot h BEFORE the flow update: this is s_t for the (s_t, a_t, s_{t+1}) trace
-        self._h_at_action = self.h.clone().detach()
-
         # 1. Retrieve SPM temporal trace
         spm_trace = self.spm.get_trace().to(device)
 
         # 2. Update continuous flow h on sphere S^(d-1)
-        x_flow = torch.cat([obs_t, spm_trace], dim=-1)
-        self.h = self.flow(x_flow, self.h.to(device))
+        # ``learn_consequence(next_obs=...)`` may already have recoupled this
+        # exact observation. Reusing it once avoids integrating the same sensory
+        # consequence twice.
+        prefetched = self._prefetched_obs
+        if prefetched is not None and torch.equal(obs_t, prefetched.to(device)):
+            self._prefetched_obs = None
+        else:
+            self._prefetched_obs = None
+            x_flow = torch.cat([obs_t, spm_trace], dim=-1)
+            self.h = self.flow(x_flow, self.h.to(device))
 
         # Constitution §6: The attractor field is maintained as a
         # diagnostic mechanism (which regions of latent space are
@@ -371,6 +815,11 @@ class Organism(nn.Module):
                     tendency = tendency.reshape(self.h.shape)
                 blended = 0.999 * self.h + 0.001 * tendency
                 self.h = F.normalize(blended, p=2, dim=-1)
+
+        # This is the situated latent from which the released action actually
+        # departs. The old code snapshotted before perceiving obs_t.
+        self._h_at_action = self.h.clone().detach()
+        self._entity_feats_at_action = entities_feats.detach().clone()
 
         # 3. Situated Semantics Binding (Constitution §3)
         sigma_t = self.semantics.bind(spm_trace, entities_pos, entities_feats, context, self_state)
@@ -402,47 +851,50 @@ class Organism(nn.Module):
                     "film_beta_norm": beta_norm,
                 })
 
-        # Generate action proposal from movement policy
-        flat_embeds = sigma_t.reshape(1, -1)
+        # Form the mean of the organism's stochastic abstract action policy.
+        # Exploration is sampled only after the deterministic OLF corrections,
+        # so the recorded score is the score of the process that generated the
+        # downstream candidate action.
+        # Meaning is learned from observed consequences, not from whichever
+        # policy-gradient direction happened to improve an episode. Motor/FLC
+        # consume the representation without owning the semantic encoder.
+        policy_sigma = sigma_t.detach()
+        flat_embeds = policy_sigma.reshape(1, -1)
         policy_inputs = torch.cat([self.h, flat_embeds], dim=-1)
-        a_move = self.movement_policy(policy_inputs)  # (1, 3): (dx, dy, u)
-
-        # Add exploration noise during training (not evaluation)
-        if not evaluate:
-            decay = max(0.0, 1.0 - self.episode_count / (self.warmup_episodes * 5))
-            noise_std = self.explore_noise_min + (self.explore_noise_init - self.explore_noise_min) * decay
-            noise = torch.randn_like(a_move) * noise_std
-            a_move = torch.clamp(a_move + noise, -1.0, 1.0)
-
-        # Candidate action assembly: a_move now already contains (dx, dy, u) — no padding needed.
-        a_cand_init = a_move
-        consequences = self.semantics.predict_consequences(sigma_t, a_cand_init)
-
-        # v0.3.2.6: Per-entity affordance gradient → action pressure.
-        # Shift action toward the entity with highest affordance. No learned
-        # parameters — uses the value predictions directly. This is the
-        # "entity consequence gradient → action pressure" path.
-        with torch.no_grad():
-            entity_affordance = self._compute_entity_affordance(consequences)
-            afford_weights = torch.softmax(entity_affordance, dim=-1)
-            afford_dir = (afford_weights.unsqueeze(-1) * entities_pos).sum(dim=1)
-            afford_dir = F.normalize(afford_dir + 1e-8, p=2, dim=-1)
-            af_mag = max(-0.3, min(0.3, entity_affordance.mean().item()))
-            a_cand_init = a_cand_init.clone()
-            a_cand_init[:, :2] = a_cand_init[:, :2] + 0.2 * af_mag * afford_dir
+        action_mean = self.movement_policy(policy_inputs)
 
         # FLC is an OLF subsystem: current latent -> future latent -> inverse
-        # transfer correction -> action proposal. Boundary and motor remain
-        # separate downstream stages.
-        a_cand_init, flc_diag = self.apply_future_control(
-            sigma_t, self_state, a_cand_init
+        # transfer correction -> action-policy mean. Stochastic exploration is
+        # applied after this correction; boundary and motor remain separate
+        # downstream stages.
+        action_mean, flc_diag = self.apply_future_control(
+            policy_sigma,
+            self_state,
+            action_mean,
+            context=context,
         )
+        (
+            a_cand_init,
+            policy_log_prob,
+            policy_raw_sample,
+            exploration_std,
+            policy_distribution_mean,
+            intent_log_prob,
+        ) = self._sample_abstract_action(action_mean, evaluate=evaluate)
         consequences = self.semantics.predict_consequences(sigma_t, a_cand_init)
 
         # 4. Impasse and context assessment
         impasse_detected = self.impasse_detector.detect()
-        uncertainty = consequences["uncertainty"].mean().item()
-        risk = consequences["terminal_risk"].max().item()
+        grounding_confidence = self._consequence_grounding_confidence()
+        predicted_uncertainty = consequences["uncertainty"].mean().item()
+        uncertainty = (
+            (1.0 - grounding_confidence)
+            + grounding_confidence * predicted_uncertainty
+        )
+        risk = (
+            grounding_confidence
+            * consequences["terminal_risk"].max().item()
+        )
         closure_pressure = self_state.squeeze(0).cpu().numpy()
 
         # v0.3.2.9: Compute need_pressure from self_state.
@@ -456,7 +908,10 @@ class Organism(nn.Module):
         # Scalar summary: mean over entities.
         with torch.no_grad():
             entity_affordance = self._compute_entity_affordance(consequences)
-            affordance_pressure = float(entity_affordance.mean().item())
+            affordance_pressure = (
+                grounding_confidence
+                * float(entity_affordance.mean().item())
+            )
 
         # v0.3.1.2 diagnostic: record impasse state and pre-arbitration
         # uncertainty/risk for the diagnostic report. Logging only.
@@ -472,6 +927,7 @@ class Organism(nn.Module):
                 "impasse": bool(impasse_detected),
                 "uncertainty": float(uncertainty),
                 "pred_risk": float(risk),
+                "consequence_grounding_confidence": grounding_confidence,
                 "need_pressure": need_pressure,
                 "closure_pressure": [float(x) for x in closure_pressure],
                 "affordance_pressure": affordance_pressure,
@@ -618,10 +1074,10 @@ class Organism(nn.Module):
         # delta is computed from (h_next − h_t) once h_{t+1} is known next call.
         self.spm.update(self.h)
         self.rtcm.add_step(
-            self._h_at_action if self._h_at_action is not None else self.h,
+            self.h,
             a_final,
             consequence=None,  # filled by learn_consequence via _backfill_consequence
-            h_next=self.h,
+            h_next=None,
         )
         self.impasse_detector.add_step(agent_pos.squeeze(0).cpu().numpy(), a_final)
 
@@ -650,6 +1106,7 @@ class Organism(nn.Module):
             "readiness": final_readiness,
             "readiness_factor": float(readiness_factor),
             "affordance_pressure": affordance_pressure,
+            "consequence_grounding_confidence": grounding_confidence,
             "diagnostic_decay": diag_decay,
             "recouple_required": self._recouple_required,
             "future_horizon": float(flc_diag["future_horizon"].reshape(-1)[0].item()),
@@ -658,13 +1115,50 @@ class Organism(nn.Module):
             "flc_correction_norm": float(flc_diag["flc_correction_norm"].reshape(-1)[0].item()),
             "flc_action_delta_norm": float(flc_diag["flc_action_delta_norm"].reshape(-1)[0].item()),
             "flc_gain": float(flc_diag["flc_gain"].reshape(-1)[0].item()),
+            "future_hint_confidence": float(
+                flc_diag["future_hint_confidence"].reshape(-1)[0].item()
+            ),
+            "memory_action_confidence": float(
+                flc_diag["memory_action_confidence"].reshape(-1)[0].item()
+            ),
             "risk_with_action": veto_diag.get("risk_with_action", 0.0),
             "veto_boundary_risk": veto_diag.get("veto_boundary_risk", 0.0),
             "risk_baseline": veto_diag.get("risk_baseline", 0.0),
+            # Internal rollout trace consumed by experiments.run_core. The
+            # log-probability retains its graph; diagnostic tensors do not.
+            "_policy_log_prob": policy_log_prob,
+            "_policy_mean": action_mean.detach(),
+            "_policy_distribution_mean": policy_distribution_mean,
+            "_policy_raw_sample": policy_raw_sample,
+            "_policy_exploration_std": exploration_std,
+            "_policy_exploration_intent": self._exploration_intent.detach(),
+            "_intent_log_prob": intent_log_prob,
+            "_episode_intent": (
+                None
+                if self._episode_intent is None
+                else self._episode_intent.detach()
+            ),
+            "_episode_intent_raw_sample": self._episode_intent_raw_sample,
+            "_episode_intent_distribution_mean": (
+                self._episode_intent_distribution_mean
+            ),
+            "_episode_intent_source": self._episode_intent_source,
+            "_training_h": self.h.detach(),
+            "_training_sigma": sigma_t,
+            "_training_spm_trace": spm_trace.detach(),
+            "_training_abstract_action": a_cand_init.detach(),
         }
         
-    def learn_consequence(self, reward, was_lethal, hunger_delta, fatigue_delta):
-        """Stores step outcome in consequence trace memory buffer.
+    def learn_consequence(
+        self,
+        reward,
+        was_lethal,
+        hunger_delta,
+        fatigue_delta,
+        next_obs=None,
+        store=True,
+    ):
+        """Recouple to an outcome and optionally store persistent traces.
 
         The trace follows Constitution §4: (situation_before, action, situation_after, consequence).
         - situation_before: snapshot of h BEFORE the action that produced this consequence
@@ -688,6 +1182,7 @@ class Organism(nn.Module):
                 },
                 "motor_memory_size": int(self.motor_memory.size()),
                 "recouple_cleared": self._recouple_required,
+                "persistent_store": bool(store),
             })
 
         if self.last_sigma is not None and self.last_action is not None:
@@ -696,50 +1191,84 @@ class Organism(nn.Module):
                 dtype=np.float32,
             )
             s_t = self._h_at_action if self._h_at_action is not None else self.h
-            # Pass current h (s_{t+1}) as s_after for slow consolidation
-            self.consequence_memory.add_trace(
-                self.last_sigma.mean(dim=1),
-                self.last_action,
-                s_t,
-                consequence_vec,
-                s_after=self.h,
+
+            # Recouple through the actual next observation before writing any
+            # transformation memory. Legacy callers may omit next_obs; they keep
+            # the old no-deformation fallback for API compatibility only.
+            s_after = self._recouple_observation(
+                next_obs,
+                s_t=s_t,
+                track_grad=bool(store and self.training),
             )
-            # Backfill RTCM with the per-step consequence so R_Δ learns the
-            # effect actually observed at this step, not just the final outcome.
-            if self.rtcm.history:
-                self.rtcm.history[-1]["consequence"] = torch.FloatTensor(
-                    consequence_vec
-                ).unsqueeze(0)
+            self.last_observed_effect = log_map_sphere(
+                s_t.detach(), s_after.detach()
+            )
 
-            self.recent_consequence_val = reward - 1.0 * was_lethal
+            event_mask = torch.zeros(
+                self.num_entities, dtype=torch.bool, device=self.h.device
+            )
+            if (
+                self._entity_feats_at_action is not None
+                and self._prefetched_obs is not None
+            ):
+                _, _, _, _, next_entity_feats = self.parse_obs(
+                    self._prefetched_obs.to(self.h.device)
+                )
+                event_mask = entity_feature_event_mask(
+                    self._entity_feats_at_action.to(self.h.device),
+                    next_entity_feats,
+                ).squeeze(0)
+            self.last_entity_event_mask = event_mask.detach()
+            if store:
+                self.consequence_events_seen.add_(event_mask.sum())
+                if self.use_prospective_event_grounding:
+                    self.prospective_events_seen.add_(event_mask.sum())
 
-            # Constitution §6: Update the attractor field on strong
-            # positive or lethal consequences. v3.1.1: throttled to once
-            # per 10 episodes to avoid attractor explosion.
-            if hasattr(self, "attractor_field") and not (
+            if store:
+                self.consequence_memory.add_trace(
+                    self.last_sigma.mean(dim=1),
+                    self.last_action,
+                    s_t,
+                    consequence_vec,
+                    s_after=s_after,
+                )
+            self.rtcm.complete_last_step(consequence_vec, s_after)
+
+            # Arbitration receives only organism-native deformation: relief is
+            # positive, increasing need and lethal collapse are negative. Raw
+            # benchmark reward must not become an implicit mode label.
+            self.recent_consequence_val = (
+                -float(hunger_delta)
+                - float(fatigue_delta)
+                - float(was_lethal)
+            )
+
+            # Constitution §6: body relief can establish a preferred latent
+            # region. This uses observed homeostatic deformation, never a task
+            # reward or status label. Bounded attractor capacity prevents
+            # unbounded writes; prospective consolidation is handled separately.
+            if store and hasattr(self, "attractor_field") and not (
                 hasattr(self, "ablation_type") and self.ablation_type == "no_closure_pressure"
             ):
-                if not hasattr(self, "_episodes_since_attractor"):
-                    self._episodes_since_attractor = 0
-                self._episodes_since_attractor += 1
-                if self._episodes_since_attractor >= 10:
-                    self._episodes_since_attractor = 0
-                    if reward > 0.5 and not was_lethal:
-                        with torch.no_grad():
-                            self.attractor_field.create_at(self.h)
+                body_relief = max(0.0, -float(hunger_delta)) + max(
+                    0.0, -float(fatigue_delta)
+                )
+                if body_relief > 1e-6 and not was_lethal:
+                    with torch.no_grad():
+                        self.attractor_field.create_at(s_after)
 
             # v3: record the (before_h, action, after_h) transformation into
             # motor_memory. The success flag is 0.0 if lethal, 1.0 otherwise.
             # Reward is the raw reward signal (used for ranking similar
             # transformations in query_similar_action).
-            if hasattr(self, "motor_memory") and not (
+            if store and hasattr(self, "motor_memory") and not (
                 hasattr(self, "ablation_type") and self.ablation_type == "no_motor_memory"
             ):
                 success_flag = 0.0 if was_lethal else 1.0
                 self.motor_memory.add_transformation(
                     s_t,
                     self.last_action,
-                    self.h,
+                    s_after,
                     success_flag,
                     float(reward),
                 )

@@ -71,8 +71,11 @@ def smoke_test_full_olf():
                 missing = REQUIRED_INFO_KEYS - set(info.keys())
                 if missing:
                     raise AssertionError(f"missing info keys: {missing}")
-                obs, reward, done, _ = env.step(action)
-                agent.learn_consequence(reward, 0.0, 0.0, 0.0)
+                next_obs, reward, done, _ = env.step(action)
+                agent.learn_consequence(
+                    reward, 0.0, 0.0, 0.0, next_obs=next_obs
+                )
+                obs = next_obs
                 steps += 1
             print(f"  [OK] {name:30s} steps={steps}")
         except Exception:
@@ -104,8 +107,11 @@ def smoke_test_ablations():
             obs = np.random.randn(18).astype(np.float32)
             for _ in range(5):
                 action, _ = agent.select_action(obs)
-                agent.learn_consequence(0.1, 0.0, 0.01, 0.005)
-                obs = np.random.randn(18).astype(np.float32)
+                next_obs = np.random.randn(18).astype(np.float32)
+                agent.learn_consequence(
+                    0.1, 0.0, 0.01, 0.005, next_obs=next_obs
+                )
+                obs = next_obs
             print(f"  [OK] {ab}")
         except Exception:
             tb = traceback.format_exc()

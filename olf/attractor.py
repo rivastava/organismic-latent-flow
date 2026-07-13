@@ -70,7 +70,10 @@ class AttractorField(nn.Module):
             attractors.append(v / v.norm())
         self.attractors = nn.Parameter(torch.stack(attractors))
         # Per-attractor weight (logits, passed through sigmoid).
-        self.weights = nn.Parameter(torch.zeros(max_attractors))
+        # Slots start inactive. Initializing logits at zero made every random
+        # placeholder an active 0.5-weight goal and left no room for experience
+        # to create a real attractor.
+        self.weights = nn.Parameter(torch.full((max_attractors,), -10.0))
         # Per-attractor "harm" counter; if it exceeds a threshold, the
         # attractor is dissolved (weight → 0).
         self.register_buffer("harm_counters", torch.zeros(max_attractors))
@@ -102,11 +105,15 @@ class AttractorField(nn.Module):
             h = h.unsqueeze(0)
         weights = torch.sigmoid(self.weights)  # (K,)
         all_a = F.normalize(self.attractors, p=2, dim=-1)  # (K, D)
-        # Weighted centroid of all attractors.
-        total_w = weights.sum()
-        if total_w < 1e-6:
+        active_mask = weights > 0.1
+        if not bool(active_mask.any()):
             return h, 0.0
-        centroid = (weights.unsqueeze(-1) * all_a).sum(dim=0, keepdim=True)  # (1, D)
+        active_weights = weights[active_mask]
+        active_points = all_a[active_mask]
+        total_w = active_weights.sum()
+        centroid = (
+            active_weights.unsqueeze(-1) * active_points
+        ).sum(dim=0, keepdim=True)
         centroid = F.normalize(centroid, p=2, dim=-1)
         # Tendency: pull h toward the weighted centroid.
         diff = centroid - h  # (batch, D)
@@ -126,16 +133,37 @@ class AttractorField(nn.Module):
         with torch.no_grad():
             self.weights[idx] = -10.0  # sigmoid(-10) ≈ 0
 
-    def create_at(self, h, idx=None):
-        """Create a new attractor at h.
+    def create_at(self, h, idx=None, merge_similarity=0.95):
+        """Create or reinforce an experience-grounded attractor at h.
 
-        If idx is None, pick an inactive slot.
+        If an active attractor already describes the same sphere region, merge
+        the observation into it. Otherwise use an inactive slot. Full memory
+        does not evict without a prospective-value rule.
         """
         if h.dim() > 1:
             h = h.squeeze(0)
         h_n = F.normalize(h, p=2, dim=-1)
         if idx is None:
             weights = torch.sigmoid(self.weights)
+            active = (weights > 0.1).nonzero(as_tuple=False).squeeze(-1)
+            if active.numel() > 0:
+                active_points = F.normalize(
+                    self.attractors[active], p=2, dim=-1
+                )
+                similarities = active_points @ h_n
+                best_local = int(torch.argmax(similarities).item())
+                if float(similarities[best_local].item()) >= merge_similarity:
+                    idx = int(active[best_local].item())
+                    with torch.no_grad():
+                        merged = 0.8 * self.attractors[idx] + 0.2 * h_n
+                        self.attractors[idx] = F.normalize(
+                            merged, p=2, dim=-1
+                        )
+                        self.weights[idx] = torch.clamp(
+                            self.weights[idx] + 0.25, max=3.0
+                        )
+                        self.harm_counters[idx] = 0.0
+                    return idx
             inactive = (weights < 0.1).nonzero(as_tuple=False).squeeze(-1)
             if inactive.numel() == 0:
                 return None  # no room

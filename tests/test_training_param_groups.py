@@ -13,14 +13,24 @@ def test_flc_parameters_have_separate_low_lr_group():
     agent = Organism(obs_dim=18, action_dim=3)
     groups = build_training_param_groups(agent, lr=0.01)
 
-    assert [group["lr"] for group in groups] == [0.0001, 0.001, 0.00001]
+    assert [group["lr"] for group in groups] == [
+        0.0001,
+        0.001,
+        0.001,
+        0.00001,
+    ]
 
     policy_ids = _param_ids(agent.movement_policy.parameters())
     flc_ids = _param_ids(agent.flc.parameters())
+    grounded_ids = _param_ids(
+        list(agent.flc.grounded_transfer.parameters())
+        + list(agent.flc.grounded_motor_projection.parameters())
+    )
     grouped = [_param_ids(group["params"]) for group in groups]
 
     assert grouped[0] == policy_ids
-    assert grouped[2] == flc_ids
+    assert grouped[2] == grounded_ids
+    assert grouped[3] == flc_ids - grounded_ids
     assert not grouped[1] & policy_ids
     assert not grouped[1] & flc_ids
 

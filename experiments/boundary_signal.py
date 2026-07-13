@@ -67,7 +67,14 @@ def evaluate_with_diagnostics(agent, task_name, seed, num_episodes):
             was_lethal = 1.0 if info["status"] in ("death", "starvation") else 0.0
             hunger_delta = next_obs[2] - obs[2]
             fatigue_delta = next_obs[3] - obs[3]
-            agent.learn_consequence(reward, was_lethal, hunger_delta, fatigue_delta)
+            agent.learn_consequence(
+                reward,
+                was_lethal,
+                hunger_delta,
+                fatigue_delta,
+                next_obs=next_obs,
+                store=False,
+            )
             obs = next_obs
 
         episodes.append({

@@ -100,6 +100,8 @@ def run_trajectory(task="self_state_meaning", seed=0, out_path=None, train_episo
             was_lethal,
             next_obs[2] - obs[2],
             next_obs[3] - obs[3],
+            next_obs=next_obs,
+            store=False,
         )
 
         status = env_info["status"]

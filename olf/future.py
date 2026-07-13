@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from olf.geometry import exponential_map, project_to_tangent
+from olf.geometry import exponential_map, log_map_sphere, project_to_tangent
 from olf.transfer import InverseTransferField
 
 
@@ -98,37 +98,154 @@ class FutureLatentControl(nn.Module):
             nn.Linear(hidden_dim, action_dim),
             nn.Tanh(),
         )
+        # Separate inverse motor for event-grounded nonlocal endpoints. Its
+        # input intentionally excludes ``base_action`` so it cannot satisfy
+        # inverse-transfer training by copying the local policy proposal.
+        # Forking RNG prevents an inactive research path from changing all
+        # downstream organism initialization.
+        with torch.random.fork_rng(devices=[]):
+            self.grounded_transfer = InverseTransferField(
+                latent_dim=latent_dim
+            )
+            self.grounded_motor_projection = nn.Sequential(
+                nn.Linear(
+                    latent_dim * 3 + sigma_dim + self_state_dim,
+                    hidden_dim,
+                ),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim),
+                nn.Tanh(),
+            )
         self.gain = nn.Parameter(torch.tensor(-2.0))
 
-    def forward(self, current_latent, sigma_flat, self_state, base_action):
-        future = self.future_field(current_latent, sigma_flat, self_state)
-        present_correction = self.transfer.inverse_correction(
-            current_latent, future.latent
+    def grounded_inverse_action(
+        self,
+        current_latent,
+        target_future,
+        sigma_flat,
+        self_state,
+    ):
+        present_correction = self.grounded_transfer.inverse_correction(
+            current_latent, target_future
         )
         projection_input = torch.cat(
             [
                 current_latent,
-                future.latent,
+                target_future,
                 present_correction,
                 sigma_flat,
                 self_state,
-                base_action,
             ],
             dim=-1,
         )
-        action_delta = self.motor_projection(projection_input)
+        return (
+            self.grounded_motor_projection(projection_input),
+            present_correction,
+        )
+
+    def grounded_inverse_loss(
+        self,
+        *,
+        current_latents,
+        target_future,
+        sigma_flat,
+        self_state,
+        target_actions,
+        weights=None,
+    ):
+        predicted_actions, _ = self.grounded_inverse_action(
+            current_latents,
+            target_future,
+            sigma_flat,
+            self_state,
+        )
+        per_step = (predicted_actions - target_actions).square().mean(dim=-1)
+        if weights is None:
+            return per_step.mean()
+        normalized = weights / weights.mean().clamp_min(1e-8)
+        return (normalized * per_step).mean()
+
+    def forward(
+        self,
+        current_latent,
+        sigma_flat,
+        self_state,
+        base_action,
+        future_hint=None,
+        hint_confidence=0.0,
+        use_grounded_inverse=False,
+        grounded_action_hint=None,
+        action_hint_confidence=0.0,
+    ):
+        future = self.future_field(current_latent, sigma_flat, self_state)
+        target_future = future.latent
+        confidence = float(max(0.0, min(1.0, hint_confidence)))
+        if future_hint is not None and confidence > 0.0:
+            generated_delta = log_map_sphere(current_latent, future.latent)
+            grounded_delta = log_map_sphere(current_latent, future_hint)
+            target_future = exponential_map(
+                current_latent,
+                (1.0 - confidence) * generated_delta
+                + confidence * grounded_delta,
+            )
+        if use_grounded_inverse:
+            inverse_action, present_correction = (
+                self.grounded_inverse_action(
+                    current_latent,
+                    target_future,
+                    sigma_flat,
+                    self_state,
+                )
+            )
+            action_confidence = float(
+                max(0.0, min(1.0, action_hint_confidence))
+            )
+            if grounded_action_hint is not None and action_confidence > 0.0:
+                inverse_action = (
+                    (1.0 - action_confidence) * inverse_action
+                    + action_confidence * grounded_action_hint
+                )
+            action_delta = inverse_action - base_action
+        else:
+            action_confidence = 0.0
+            present_correction = self.transfer.inverse_correction(
+                current_latent, target_future
+            )
+            projection_input = torch.cat(
+                [
+                    current_latent,
+                    target_future,
+                    present_correction,
+                    sigma_flat,
+                    self_state,
+                    base_action,
+                ],
+                dim=-1,
+            )
+            action_delta = self.motor_projection(projection_input)
         gain = 0.25 * torch.sigmoid(self.gain)
+        if action_confidence > 0.0:
+            gain = gain + (1.0 - gain) * action_confidence
         action = torch.clamp(base_action + gain * action_delta, -1.0, 1.0)
 
         diagnostics = {
             "future_horizon": future.horizon.detach(),
             "future_abstraction": future.abstraction.detach(),
             "future_alignment": F.cosine_similarity(
-                current_latent.detach(), future.latent.detach(), dim=-1, eps=1e-8
+                current_latent.detach(), target_future.detach(), dim=-1, eps=1e-8
             ).unsqueeze(-1),
             "flc_correction_norm": present_correction.detach().norm(dim=-1, keepdim=True),
             "flc_action_delta_norm": action_delta.detach().norm(dim=-1, keepdim=True),
             "flc_gain": gain.detach().reshape(1, 1),
+            "future_hint_confidence": torch.full(
+                (current_latent.shape[0], 1),
+                confidence,
+                device=current_latent.device,
+            ),
+            "memory_action_confidence": torch.full(
+                (current_latent.shape[0], 1),
+                action_confidence,
+                device=current_latent.device,
+            ),
         }
         return action, diagnostics
-
