@@ -7,6 +7,12 @@ The project explores whether memory, action, boundary risk, prospective
 control, and recoupling can be represented as roles of one continuous
 organismic process.
 
+> **Experimental branch:** `experimental/branching-latent-flow` studies a
+> bounded population of interchangeable spherical continuations: transfer-law
+> discovery, persistence, relational reuse, recoupling, and situated
+> consequence deformation. It remains isolated from the OLF organism. See
+> [`experiments/branching_latent_flow/`](experiments/branching_latent_flow/).
+
 ## Core Idea
 
 OLF keeps a latent state `h(t)` on the unit sphere. The organism observes a
