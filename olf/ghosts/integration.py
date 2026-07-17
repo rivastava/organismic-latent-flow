@@ -80,6 +80,10 @@ class GhostIntegration:
         # that actually influenced, and (filled at recouple) the released action.
         self._pending_transaction = None
         self._aborted_at_reset = False
+        self._births_total = 0
+        self._merges_total = 0
+        self._evictions_total = 0
+        self._recouplings_total = 0
 
         # Hard audit: the ghost config / population must not carry prohibited labels.
         assert_no_prohibited_labels(config)
@@ -89,6 +93,35 @@ class GhostIntegration:
     def _audit_population(self) -> None:
         for g in self.population._ghosts:
             assert_no_prohibited_labels(g._as_dict())
+
+    def telemetry(self) -> dict:
+        """Return detached diagnostics without changing ghost state."""
+        ghosts = self.population._ghosts
+        count = len(ghosts)
+        if count:
+            evidence = sum(float(g.evidence_support) for g in ghosts) / count
+            grounding = sum(float(g.grounding) for g in ghosts) / count
+            transfer_support = sum(len(g.transfer_actions) for g in ghosts)
+        else:
+            evidence = 0.0
+            grounding = 0.0
+            transfer_support = 0
+        return {
+            "births_total": self._births_total,
+            "merges_total": self._merges_total,
+            "evictions_total": self._evictions_total,
+            "recouplings_total": self._recouplings_total,
+            "population": count,
+            "evidence_support_mean": evidence,
+            "grounding_mean": grounding,
+            "transfer_support": transfer_support,
+        }
+
+    def _record_recoupling(self, report) -> None:
+        self._recouplings_total += 1
+        self._births_total += int(report.born)
+        self._merges_total += int(report.merged)
+        self._evictions_total += int(report.evicted_count)
 
     # ---- reset (episodic ghost state) -----------------------------------
     def reset(self) -> None:
@@ -511,6 +544,7 @@ class GhostIntegration:
                 observed_anchor.detach().reshape(1, -1)
             )[0].detach().reshape(-1)
             self._pending_transaction = None
+            self._record_recoupling(report)
             return {
                 "updated": True,
                 "population": len(self.population),
@@ -539,6 +573,7 @@ class GhostIntegration:
         self.prev_anchor = project_to_sphere(
             observed_anchor.detach().reshape(1, -1)
         )[0].detach().reshape(-1)
+        self._record_recoupling(report)
         return {
             "updated": True,
             "population": len(self.population),

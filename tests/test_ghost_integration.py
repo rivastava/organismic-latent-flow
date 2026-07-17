@@ -139,7 +139,7 @@ def test_antipodal_transport_fails():
     x = project_to_sphere(torch.randn(d))
     y = -x
     v = project_to_tangent(x, torch.randn(d))
-    assert antipodal(x, y)
+    assert bool(antipodal(x, y).any())
     try:
         parallel_transport_sphere(x, y, v)
         raise AssertionError("antipodal transport should raise")
@@ -636,6 +636,28 @@ def test_episode_reset_without_pending_does_not_report_abort():
     org.reset_state()
     assert org._ghost_reset_aborted_pending is False
     assert org.ghost._aborted_at_reset is False
+
+
+def test_telemetry_records_only_external_recoupling():
+    org = _org("observe")
+    obs = torch.randn(18).numpy()
+    before = org.ghost.telemetry()
+
+    org.select_action(obs, evaluate=True)
+    after_action = org.ghost.telemetry()
+    assert after_action == before
+
+    org.learn_consequence(0.0, 0.0, 0.0, 0.0, next_obs=obs)
+    after_recoupling = org.ghost.telemetry()
+    assert after_recoupling["recouplings_total"] == 1
+    assert after_recoupling["births_total"] == 1
+    assert after_recoupling["population"] == 1
+    assert after_recoupling["transfer_support"] == 1
+
+    org.reset_state()
+    after_reset = org.ghost.telemetry()
+    assert after_reset["recouplings_total"] == 1
+    assert after_reset["population"] == 0
 
 
 # ---- boundary evaluation works after warmup -----------------------

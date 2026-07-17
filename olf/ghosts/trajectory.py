@@ -283,7 +283,7 @@ def transport_ghost(
     # (numerically) antipodal: every great circle through both is valid, so the
     # real displacement — and therefore the ghost's transported displacement —
     # is not unique.
-    if antipodal(real_prev, real_now):
+    if bool(antipodal(real_prev, real_now).any()):
         raise ValueError(
             "ghost transport undefined across antipodal real points "
             "(non-unique geodesic displacement)"
