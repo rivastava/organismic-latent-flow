@@ -3,7 +3,7 @@ from benchmarks.base import BaseBenchmark
 
 class SelfStateMeaningEnv(BaseBenchmark):
     """
-    6. Self-state-dependent meaning (v0.3.2.7 — homeostatic consequence grounding).
+    6. Self-state-dependent meaning (homeostatic consequence grounding).
 
     Actions change internal body variables.  The usefulness of objects
     depends entirely on the agent's internal needs — not because the
@@ -18,7 +18,7 @@ class SelfStateMeaningEnv(BaseBenchmark):
         → different latent deformation
         → different future action pressure
 
-    Wrong framing (what we had before):
+    Rejected framing:
         if hungry choose food        ← task label reward
         if tired choose bed          ← task label reward
     """

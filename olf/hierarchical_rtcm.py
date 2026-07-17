@@ -1,6 +1,6 @@
 """olf/hierarchical_rtcm.py
 
-Hierarchical RTCM per Action-Sphere RTCM research memo §6.4.
+Hierarchical RTCM per RTCM design.
 
 "In favorable conditions with strong anchors, transfer-aware hierarchical
 retrieval recovered causes up to 65,536 steps back."
@@ -62,7 +62,7 @@ class HierarchicalRTCM(nn.Module):
         self.fine_rtcm.reset_history()
 
     def retrieve_top_k(self, observed_consequence, top_k=5, temperature=0.5):
-        """Hierarchical retrieval per memo §6.4.
+        """Hierarchical retrieval per RTCM design.
 
         1. Compute q_cause = R_Δᵀ @ effect_signal (cause-space query).
         2. Split fine history into coarse chunks of size `chunk_size`.

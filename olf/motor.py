@@ -18,12 +18,12 @@ class MotorCortex:
         Processes candidate action given veto verdict, mode constraints, and
         continuous viability pressure.
 
-        v0.3.2: viability is a continuous [0, 1] scalar from sigmoid risk.
+        viability is a continuous [0, 1] scalar from sigmoid risk.
         It scales motor output on ALL verdicts (except rollback, which
         reverses). This replaces the binary zero/non-zero kill switch with
         proportional viability pressure.
 
-        v0.3.2.2: readiness_factor modulates action magnitude WITHIN each
+        readiness_factor modulates action magnitude WITHIN each
         verdict regime. It does not replace the verdict — it scales the
         action inside release/hold/recouple. Clamped to [0.5, 1.2] to
         prevent complete suppression or amplification.
@@ -52,11 +52,11 @@ class MotorCortex:
             a_out = a_cand
             self.recouple_steps = 0
         
-        # v0.3.2: apply continuous viability pressure to all non-rollback verdicts
+        # apply continuous viability pressure to all non-rollback verdicts
         if verdict != "rollback":
             a_out = a_out * max(viability, 0.1)
         
-        # v0.3.2.2: readiness scales action WITHIN each verdict regime.
+        # readiness scales action WITHIN each verdict regime.
         # Clamped to [0.5, 1.2] — never fully suppress, never amplify beyond 1.2x.
         # This preserves the motor grammar while allowing readiness to modulate release.
         a_out = a_out * float(np.clip(readiness_factor, 0.5, 1.2))

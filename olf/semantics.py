@@ -18,8 +18,8 @@ class TriadicSemantics(nn.Module):
         self.hidden_dim = hidden_dim
         self.self_state_dim = self_state_dim
 
-        # v3: split binding into pre-binder (no self_state) + FiLM modulation.
-        # Pre-binder sees [SPM, o, context] only. v3.1 fix: pre-binder is
+        # split binding into pre-binder (no self_state) + FiLM modulation.
+        # Pre-binder sees [SPM, o, context] only. fix: pre-binder is
         # 2-layer (matching the original binder's depth) so that the
         # binding is not artificially weakened.
         pre_binder_input_dim = spm_dim + entity_dim + context_dim
@@ -32,14 +32,14 @@ class TriadicSemantics(nn.Module):
 
         # FiLM generator: self_state → (gamma_raw, beta), each of size hidden_dim.
         # Final modulation: sigma_t = (1 + gamma_raw) ⊙ pre + beta
-        # v3 amendment: true identity initialization (gamma_raw=0, beta=0) so
+        # amendment: true identity initialization (gamma_raw=0, beta=0) so
         # at init the binder behaves exactly like a no-FiLM linear.
         self.film_gen = nn.Linear(self_state_dim, 2 * hidden_dim)
         with torch.no_grad():
             self.film_gen.weight.zero_()
             self.film_gen.bias.zero_()
 
-        # v0.3.1.2 diagnostic: FiLM parameter norm snapshot for the
+        # diagnostic: FiLM parameter norm snapshot for the
         # "is FiLM dead?" check. Logging only.
         self._initial_film_norm = float(self.film_gen.weight.norm().item())
 
@@ -57,7 +57,7 @@ class TriadicSemantics(nn.Module):
         # Consequence prediction networks: maps (sigma_t, a_t) to outcomes
         pred_input_dim = hidden_dim + action_dim
         
-        # We output:
+        # Output tensors:
         # - dh_pred: change in latent flow state (latent_dim)
         # - value: scalar consequence value (1)
         # - terminal_risk: scalar danger/fatality risk (1) — used by Veto (when need is low)
@@ -78,7 +78,7 @@ class TriadicSemantics(nn.Module):
         
     def bind(self, spm_trace, entity_rel_pos, entity_feats, context, self_state):
         """Binds SPM, Object features, Context, and Self-state into a situated
-        embedding sigma. v3: self_state modulates the binding through FiLM.
+        embedding sigma. self_state modulates the binding through FiLM.
 
         Pre-binder sees only [SPM, o, context]. FiLM from self_state produces
         (gamma_raw, beta), and the final sigma is (1 + gamma_raw) ⊙ pre + beta.
@@ -154,11 +154,11 @@ class TriadicSemantics(nn.Module):
         share (object, context) but differ in self_state, and whose observed
         outcomes actually differed (target_diff is a positive scalar).
 
-        v3 amendment: hinge loss (ReLU(margin − diff)), not a direct
+        amendment: hinge loss (ReLU(margin − diff)), not a direct
         "require MSE > margin" loss. The pair is only used if target_diff > 0
-        (empirical contrast), so we never invent semantic labels.
+        (empirical contrast), so semantic labels are never invented.
 
-        v0.3.2: fixed entity_feats=None bug. Now accepts entity_feats_a/b.
+        fixed entity_feats=None bug. Now accepts entity_feats_a/b.
 
         Returns a scalar tensor (0 if conditions not met).
         """
@@ -177,5 +177,5 @@ class TriadicSemantics(nn.Module):
         v_b = cons_b["value"].mean()
         diff = torch.abs(v_a - v_b)
 
-        # Hinge: we want diff >= target_diff + margin; loss is max(0, target_diff + margin - diff)
+        # Hinge objective: diff >= target_diff + margin.
         return torch.clamp(target_diff + margin - diff, min=0.0)

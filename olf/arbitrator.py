@@ -10,9 +10,9 @@ class ModeArbitrator(nn.Module):
     Modes emerge based on flow state h(t), uncertainty, impasse signals, risk,
     homeostatic closure pressure, and recent consequences.
     
-    Constitution §11: Modes are control regimes of the same organismic flow,
+    Modes are control regimes of the same organismic flow,
     not separate cognitive modules. The arbitrator answers "what kind of movement
-    is the organism ready for?" not "what symbolic plan should we execute?"
+    is the organism ready for?" rather than "which symbolic plan executes?"
     """
     def __init__(self, latent_dim=32, hidden_dim=64):
         super().__init__()
@@ -40,11 +40,11 @@ class ModeArbitrator(nn.Module):
         """
         Predicts mode probabilities and the active mode index.
         
-        Constitution §11: No hard symbolic overrides. All signals flow through
+        No hard symbolic overrides. All signals flow through
         the learned arbitration network. Veto verdicts and impasse signals are
         provided as input features, not as logit overrides.
 
-        v0.3.2.6: affordance_pressure is accepted but NOT added as a separate
+        affordance_pressure is accepted but NOT added as a separate
         input (to preserve arbitrator architecture). It is already embedded
         in the readiness signal via ReadinessGate.
         """
@@ -62,7 +62,7 @@ class ModeArbitrator(nn.Module):
         inputs = torch.cat([h, u_t, i_t, r_t, c_t, rc_t, dd_t, rd_t], dim=-1)
         logits = self.arbiter_net(inputs)
         
-        # Constitution §11: Soft contextual biases instead of hard overrides.
+        # Soft contextual biases instead of hard overrides.
         # These are small nudges that the learned network can override,
         # not +15 logit hammers that force specific modes.
         bias = torch.zeros(1, 8, device=device)
@@ -77,7 +77,7 @@ class ModeArbitrator(nn.Module):
             bias[0, 4] += 3.0   # Nudge toward Revise
             bias[0, 0] -= 1.0
         
-        # v0.3.2.3: Recoupling bias - when recoupling is required (world-mutating
+        # Recoupling bias - when recoupling is required (world-mutating
         # action pending consequence), nudge toward Inspect/Recouple to test/perceive.
         if recoupling_required:
             bias[0, 1] += 2.0   # Nudge toward Inspect
@@ -90,13 +90,13 @@ class ModeArbitrator(nn.Module):
         if impasse:
             bias[0, 2] += 2.0   # Nudge toward Invent
         
-        # Constitution §14: Closure pressure increases Exploit/Release bias
+        # Closure pressure increases Exploit/Release bias
         closure_magnitude = np.linalg.norm(closure_pressure)
         if closure_magnitude > 0.7:
             bias[0, 0] += 1.5   # Nudge toward Exploit
             bias[0, 5] += 1.0   # Nudge toward Release
         
-        # Constitution §13: Diagnostic decay reduces Inspect attractiveness
+        # Diagnostic decay reduces Inspect attractiveness
         if diagnostic_decay > 0.5:
             bias[0, 1] -= 2.0   # Discourage Inspect when it's not producing value
             bias[0, 0] += 1.0   # Encourage Exploit instead
@@ -146,7 +146,7 @@ class ImpasseDetector:
 
 class ReadinessGate:
     """
-    Constitution §12: Readiness Is Separate From Action Pressure.
+    Readiness Is Separate From Action Pressure.
     
     Computes a release readiness scalar [0, 1] from:
     - Veto safety (is the action cleared by the boundary?)
@@ -184,12 +184,12 @@ class ReadinessGate:
         High readiness = safe to release action.
         Low readiness = should hold or inspect.
 
-        v0.3.2.8: parameter renamed from 'risk' to 'need_pressure'.
+        parameter renamed from 'risk' to 'need_pressure'.
         Need pressure (hunger/fatigue magnitude) drives urgency, not rollback.
         High need → higher readiness (organism should act to resolve need).
         Low need → baseline readiness.
 
-        v0.3.2.6: affordance_pressure modulates readiness. Positive
+        affordance_pressure modulates readiness. Positive
         affordance (good predicted consequence) increases readiness;
         negative affordance (bad predicted consequence) decreases it.
         The modulation is small (±0.15) to preserve the motor grammar.
@@ -204,7 +204,7 @@ class ReadinessGate:
         elif veto_verdict == "recouple":
             readiness *= 0.2
         
-        # v0.3.2.8: Need pressure increases readiness.
+        # Need pressure increases readiness.
         # High hunger/fatigue → organism should act (higher readiness).
         # Low hunger/fatigue → baseline (readiness stays 1.0).
         # This replaces the old risk scaling that suppressed readiness when
@@ -227,7 +227,7 @@ class ReadinessGate:
         if self.recoupled_steps_ago > 5:
             readiness *= max(0.5, 1.0 - 0.1 * (self.recoupled_steps_ago - 5))
 
-        # v0.3.2.6: affordance pressure modulation.
+        # affordance pressure modulation.
         # Positive affordance = good predicted consequence → higher readiness.
         # Negative affordance = bad predicted consequence → lower readiness.
         # Clamped to [-0.03, +0.03] — tiny modulation to preserve training stability.
@@ -239,7 +239,7 @@ class ReadinessGate:
 
 class DiagnosticDecayTracker:
     """
-    Constitution §13: Diagnostic Value Must Decay Without Closure.
+    Diagnostic Value Must Decay Without Closure.
     
     Tracks whether Inspect mode is producing information gain (uncertainty reduction).
     If Inspect mode isn't reducing uncertainty after N steps, diagnostic value decays
@@ -289,7 +289,7 @@ class DiagnosticDecayTracker:
     
     def get_closure_boost(self):
         """
-        Constitution §14: Returns additional closure pressure from stalled diagnostics.
+        Returns additional closure pressure from stalled diagnostics.
         When Inspect mode isn't producing value, closure pressure increases.
         """
         return self.diagnostic_decay * 0.3

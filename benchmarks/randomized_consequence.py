@@ -2,14 +2,13 @@ import numpy as np
 from benchmarks.base import BaseBenchmark
 
 class RandomizedConsequenceEnv(BaseBenchmark):
-    """
-    Constitution §16 anti-cheat control: Randomized consequences.
+    """Randomized-consequence leakage control.
     
     Same layout as target_threat, but consequences are randomized each episode.
     Entity 0 is randomly reward or danger. Entity 1 is the opposite.
     
     If the organism still succeeds when consequences are randomized,
-    the test is leaking structure (Constitution §5).
+    the test is leaking structure.
     
     Expected result: No agent should succeed consistently here.
     """

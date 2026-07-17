@@ -1,6 +1,6 @@
 """olf/constellation.py
 
-Constellation Memory per Action-Sphere RTCM research memo §6.6.
+Constellation Memory per RTCM design.
 
 "Constellation Memory attempted primary + support-cause retrieval;
 learned salience was still too weak."

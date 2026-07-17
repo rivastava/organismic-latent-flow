@@ -2,8 +2,8 @@
 
 Constitutional viability-constrained policy.
 
-Per Constitution §6: "Goals Are Attractors, Not Commands."
-Per Constitution §7: "Terminal Boundaries Are Not Rewards."
+"Goals Are Attractors, Not Commands."
+"Terminal Boundaries Are Not Rewards."
 
 A goal is a preferred region in latent dynamics. The terminal boundary
 is a viability constraint, not a negative reward. Together, they imply
@@ -66,7 +66,7 @@ class ViabilityConstrainedPolicy(nn.Module):
 
     This is a head on (h, sigma) that outputs a 3-dim action. It is
     trained to maximize ViabilityPredictor(h_{t+1}) rather than
-    external reward. Per Constitution §6, the goal is an attractor in
+    external reward. , the goal is an attractor in
     latent dynamics — keeping h in a viable region.
 
     Crucially, this DOES NOT use external reward. The training signal

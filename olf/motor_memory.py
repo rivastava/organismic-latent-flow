@@ -74,7 +74,7 @@ class MotorMemory(nn.Module):
         self.trace_before[idx] = b
         self.trace_actions[idx] = a
         self.trace_after[idx] = af
-        # v0.3.2.4: tangent-space velocity via log_map instead of Euclidean delta.
+        # tangent-space velocity via log_map instead of Euclidean delta.
         # Euclidean delta = af - b vanishes on the sphere (compact, tiny increments).
         # log_map gives the actual geodesic direction and distance on S^{d-1}.
         self.trace_delta[idx] = log_map_sphere(b.unsqueeze(0), af.unsqueeze(0)).squeeze(0)
@@ -90,13 +90,13 @@ class MotorMemory(nn.Module):
         Returns (actions, deltas, scores) tensors (k entries each), or None
         if the buffer is empty.
 
-        v3 amendments:
+        amendments:
             - score blends similarity + reward (not success * 2 - 0.5 alone,
               which was not strong enough)
             - failed transformations (success < 0.5) are masked with -1.0 so
               the organism does not repeatedly invent from failed tries.
 
-        v0.3.1.2: appends a per-call telemetry record to self.query_log
+        appends a per-call telemetry record to self.query_log
         (a list) for the diagnostic report. Telemetry is collected only
         when the calling organism has diag_mode = True; the call site
         sets self.diag_log_target before calling.
@@ -124,7 +124,7 @@ class MotorMemory(nn.Module):
         b_n = before / (before.norm(dim=-1, keepdim=True) + 1e-8)
         sim = (b_n * h_n).sum(dim=-1)
 
-        # v3 amendment: reward-blended score; failed transformations are
+        # amendment: reward-blended score; failed transformations are
         # suppressed by subtracting 1.0.
         score = sim + 0.5 * reward
         # masked_fill needs a 0-dim value tensor; pass -1.0 directly.
@@ -132,7 +132,7 @@ class MotorMemory(nn.Module):
 
         k = min(k, len(score))
         vals, idx = torch.topk(score, k)
-        # v0.3.1.2 diagnostic telemetry. Per-call log if the calling
+        # diagnostic telemetry. Per-call log if the calling
         # organism has set diag_log_target = self. Logging only.
         if getattr(self, "diag_log_target", None) is not None:
             self.diag_log_target.append({

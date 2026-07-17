@@ -1,6 +1,6 @@
 """olf/attractor.py
 
-Constitutional attractor network per Constitution §6.
+Constitutional attractor network .
 
 "A goal is a preferred region or attractor in latent dynamics."
 
@@ -62,7 +62,7 @@ class AttractorField(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_attractors = max_attractors
-        # K attractors as parameters (we overprovision; only the first
+        # K attractor parameters are allocated; only the first
         # `n_active` are used).
         attractors = []
         for _ in range(max_attractors):
@@ -119,7 +119,7 @@ class AttractorField(nn.Module):
         diff = centroid - h  # (batch, D)
         tendency = h + dt * diff
         tendency = F.normalize(tendency, p=2, dim=-1)
-        # v0.3.1.2 diagnostic: per-call log of tendency magnitude.
+        # diagnostic: per-call log of tendency magnitude.
         if getattr(self, "diag_log_target", None) is not None:
             self.diag_log_target.append({
                 "n_active": int((torch.sigmoid(self.weights) > 0.1).sum().item()),
@@ -129,7 +129,7 @@ class AttractorField(nn.Module):
         return tendency, float(total_w.item())
 
     def dissolve(self, idx):
-        """Constitution §6: dissolve an old attractor."""
+        """dissolve an old attractor."""
         with torch.no_grad():
             self.weights[idx] = -10.0  # sigmoid(-10) ≈ 0
 

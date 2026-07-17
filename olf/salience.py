@@ -2,8 +2,8 @@
 
 Prospective Salience Gate.
 
-Per the Action-Sphere RTCM research memo §8: "Retrospective salience marks
-an event important after we know its outcome. A real agent needs prospective
+Per the RTCM design: "Retrospective salience marks
+an event important after its outcome is known. Prospective salience estimates
 salience: the estimated future causal value of the event at the moment it
 occurs."
 

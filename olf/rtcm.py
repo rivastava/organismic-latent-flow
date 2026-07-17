@@ -1,8 +1,8 @@
 """olf/rtcm.py
 
-v3: Action-Sphere RTCM with transfer-aware retrieval.
+Action-Sphere RTCM with transfer-aware retrieval.
 
-Per the Action-Sphere RTCM research memo:
+RTCM design:
   - Spherical Memory: events stored as unit vectors on S^(d-1)
   - Rotary Timestamped Causal Memory (RTCM): time as phase rotation
   - Action-Sphere Causal Fields: each event has intensity (omega),
@@ -12,12 +12,12 @@ Per the Action-Sphere RTCM research memo:
   - Delay estimation: top-k delay search (not hard top-1).
   - Multi-cause: support retrieval of multiple candidate causes.
 
-The store API is unchanged (per Constitution §15):
+The store API is unchanged ():
   - add_step(h, a, consequence, h_next)
   - retrieve_causal_blame(...)  (used by experiments/run_core.py for blame weights)
-  - retrieve_delayed_credit(...)  (v3 addition)
+  - retrieve_delayed_credit(...)  (addition)
 
-The new v3 method `transfer_aware_retrieve` returns top-k past events
+The new method `transfer_aware_retrieve` returns top-k past events
 in cause-space via q_cause = R_Δᵀ effect, with delay estimation.
 """
 
@@ -48,7 +48,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
       - retrieve_delayed_credit(): top-k delayed credit from a final
         observed consequence (used for sparse-reward tasks like
         delayed_lure).
-      - transfer_aware_retrieve(): NEW v3 method that uses
+      - transfer_aware_retrieve(): NEW method that uses
         q_cause = R_Δᵀ @ effect as the cause-space query, with
         delay-aware top-k ranking.
     """
@@ -70,8 +70,8 @@ class RetrogradeTemporalCausalMemory(nn.Module):
         self.max_time = max_time
 
         # R_Δ: a small learnable operator on the manifold-tangent direction.
-        # We keep it low-rank + diagonal-skip for stability: linear + tanh.
-        # For "effect ≈ R_Δ cause" we read the next-state delta through this layer.
+        # A low-rank diagonal skip improves stability: linear + tanh.
+        # For "effect ≈ R_Δ cause", the next-state delta passes through this layer.
         self.R_delta = nn.Linear(latent_dim, latent_dim, bias=False)
         with torch.no_grad():
             # Initialize close to identity so blame starts meaningful.
@@ -93,24 +93,24 @@ class RetrogradeTemporalCausalMemory(nn.Module):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-        # v3: explicit consequence-to-latent projection (memo §4 transfer).
+        # explicit consequence-to-latent projection (RTCM design transfer).
         self.consequence_encoder = nn.Linear(4, latent_dim)
         with torch.no_grad():
             self.consequence_encoder.weight.zero_()
             self.consequence_encoder.bias.zero_()
 
-        # v3: action-sphere parameters. The "intensity" omega is per-step
+        # action-sphere parameters. The "intensity" omega is per-step
         # (depends on action magnitude); local density rho and compatibility
         # chi are learned to weight candidate causes.
         self.rho = nn.Parameter(torch.zeros(latent_dim))
         self.chi = nn.Parameter(torch.ones(latent_dim))
 
-        # v3: rotary frequencies for time-as-phase.
+        # rotary frequencies for time-as-phase.
         self.register_buffer(
             "freqs", torch.linspace(0.5, 4.0, rotary_freqs, dtype=torch.float32)
         )
 
-        # v3: delay posterior head. Outputs a (max_delay,) softmax over
+        # delay posterior head. Outputs a (max_delay,) softmax over
         # candidate delay buckets. Used to estimate p(Δ | effect, context).
         self.delay_head = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -131,10 +131,10 @@ class RetrogradeTemporalCausalMemory(nn.Module):
     def add_step(self, h, a, consequence=None, h_next=None):
         """Logs a transition step.
 
-        v3: also computes action intensity omega = ||a|| and stores the
+        also computes action intensity omega = ||a|| and stores the
         current time t (used by rotary phase).
         """
-        # Normalize h to the sphere (memo §1: events on S^(d-1)).
+        # Normalize h to the sphere (RTCM design: events on S^(d-1)).
         h_n = F.normalize(h, p=2, dim=-1)
 
         a_t = torch.as_tensor(a, dtype=torch.float32, device=h_n.device).reshape(-1)
@@ -142,7 +142,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
             pad = torch.zeros(self.action_dim, device=h_n.device)
             pad[: min(self.action_dim, a_t.shape[0])] = a_t[: min(self.action_dim, a_t.shape[0])]
             a_t = pad
-        # v3: action intensity is the L2 norm of the action vector.
+        # action intensity is the L2 norm of the action vector.
         intensity = float(a_t.norm().item())
 
         entry = {
@@ -258,7 +258,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
     ):
         """Top-k delayed credit from the final observed consequence.
 
-        v3 with locked amendments:
+        with locked amendments:
           - Softmax normalization (not raw) over the top-k raw scores.
           - Temporal floor so old causes don't vanish completely.
           - Explicit consequence_encoder projection.
@@ -321,7 +321,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
                 (idx, float(w.item()))
                 for (idx, _), w in zip(top, weights, strict=False)
             ]
-            # v0.3.1.2 diagnostic: per-call log of retrieved indices/weights.
+            # diagnostic: per-call log of retrieved indices/weights.
             if getattr(self, "diag_log_target", None) is not None:
                 self.diag_log_target.append({
                     "method": "retrieve_delayed_credit",
@@ -332,7 +332,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
                 })
             return out
 
-    # --------------------------------------------------------- NEW v3 METHOD
+    # --------------------------------------------------------- NEW METHOD
 
     def transfer_aware_retrieve(
         self,
@@ -342,10 +342,10 @@ class RetrogradeTemporalCausalMemory(nn.Module):
         delay_top_m=8,
         temperature=0.5,
     ):
-        """v3: Transfer-aware retrieval per memo §3.
+        """Transfer-aware retrieval per RTCM design.
 
         "Inverse transfer produces a cause-space query that can locate old
-        causes far better than raw effect similarity." (memo §6.2)
+        causes far better than raw effect similarity." (RTCM design)
 
         Algorithm:
           1. Project the observed consequence into latent effect space
@@ -414,7 +414,7 @@ class RetrogradeTemporalCausalMemory(nn.Module):
                     p_delay = float(delay_probs[delta].item())
                 else:
                     p_delay = 1e-3
-                # Action intensity: memo §2: causal impact = omega * rho * chi.
+                # Action intensity: RTCM design: causal impact = omega * rho * chi.
                 intensity = step.get("intensity", 0.0)
                 scores.append((idx, cos * p_delay * (1.0 + intensity)))
 
@@ -433,11 +433,11 @@ class RetrogradeTemporalCausalMemory(nn.Module):
     # ------------------------------------------------------------------ train
 
     def train_step(self, lr=1e-3):
-        """Train R_Δ, the blame estimator, and v3 additions (consequence
+        """Train R_Δ, the blame estimator, and additions (consequence
         encoder, delay head, action-sphere parameters) from current
         history.
 
-        v3 adds:
+        adds:
           - Loss on consequence_encoder (so it learns a useful effect
             projection).
           - Loss on delay_head (so the delay posterior learns from the
@@ -479,14 +479,14 @@ class RetrogradeTemporalCausalMemory(nn.Module):
                     F.binary_cross_entropy_with_logits(logit, was_important)
                 )
 
-                # v3: train consequence_encoder to map observed consequence
+                # train consequence_encoder to map observed consequence
                 # to the actual effect in latent space.
                 if c is not None and c.shape[-1] == 4:
                     c_t = c.to(h_t.device)
                     pred_e_signal = self.consequence_encoder(c_t)
                     encoder_losses.append(F.mse_loss(pred_e_signal, effect))
 
-                # v3: train delay head: target is the actual delay (time
+                # train delay head: target is the actual delay (time
                 # since this event occurred).
                 if c is not None and c.shape[-1] == 4:
                     t_event = step.get("t", 0)

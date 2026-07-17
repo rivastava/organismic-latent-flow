@@ -2,7 +2,7 @@
 
 Bounded fast trace memory + slow flow-field consolidation.
 
-Constitution §4: "Slow learning may deform the flow field, but fast trace
+"Slow learning may deform the flow field, but fast trace
 memory must still exist. Do not remove geometric memory too early."
 
 Two memory layers co-exist here:
@@ -157,7 +157,7 @@ class ConsequenceMemory(nn.Module):
         Samples (s_t, a_t, s_{t+1}) tuples from the trace buffer and runs a
         small gradient descent step on the flow net's parameters so that
         its predicted next-state delta (s_{t+1} − s_t) matches the
-        observed one. This is the slow path of Constitution §4.
+        observed one. This is the slow consolidation path.
 
         Returns the loss tensor or None if the buffer is too small.
         """
@@ -175,7 +175,7 @@ class ConsequenceMemory(nn.Module):
         s_before = self.trace_s_before[chosen]
         s_after = self.trace_s_after[chosen]
 
-        # We don't store observations in fast trace memory. We use a
+        # Fast trace memory excludes observations and uses a
         # "neutral" zero-observation stand-in sized to whatever the flow
         # net's input dimension expects. The flow net still receives s_t as
         # the prior state, so the gradient is on the s_t → s_{t+1} mapping.

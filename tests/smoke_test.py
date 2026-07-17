@@ -1,4 +1,4 @@
-"""Smoke test for the OLF v0.1 architecture.
+"""Smoke test for the OLF architecture.
 
 Runs each of the 13 modular benchmarks for one episode with the full OLF
 organism. Asserts that no crash occurs and that the constitutional signal
@@ -55,7 +55,7 @@ REQUIRED_INFO_KEYS = {"mode", "verdict", "risk", "readiness", "diagnostic_decay"
 
 def smoke_test_full_olf():
     print("=" * 60)
-    print("OLF v0.1 Smoke Test — Full Organism")
+    print("OLF Smoke Test — Full Organism")
     print("=" * 60)
     failures = []
     for name, EnvClass in BENCHMARKS:
@@ -97,7 +97,7 @@ def smoke_test_ablations():
         "no_invention", "ungated_invention", "no_recoupling_constraint",
         "no_closure_pressure", "no_diagnostic_decay",
         "no_future_latent",
-        "no_motor_memory",  # v3 internal ablation
+        "no_motor_memory",  # internal ablation
     ]
     failures = []
     for ab in required_ablations:
@@ -123,7 +123,7 @@ def smoke_test_ablations():
 def smoke_test_mlp_baseline():
     print()
     print("=" * 60)
-    print("OLF v0.1 Smoke Test — MLP Baseline")
+    print("OLF Smoke Test — MLP Baseline")
     print("=" * 60)
     try:
         agent = MLPBaselineAgent()

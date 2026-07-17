@@ -1,8 +1,8 @@
 """olf/spm.py
 
-v3: Spherical Memory + Rotary Timestamped Causal Memory (RTCM).
+Spherical Memory + Rotary Timestamped Causal Memory (RTCM).
 
-Per the Action-Sphere RTCM research memo:
+RTCM design:
   - Spherical Memory: events stored as unit vectors on S^(d-1)
   - Rotary Timestamped Causal Memory: time as phase rotation
       phi(t) = [cos(w_1 t), ..., cos(w_F t), sin(w_1 t), ..., sin(w_F t)]
@@ -14,7 +14,7 @@ unit-normalized and a rotary timestamp phi(t) is applied. The `get_trace`
 returns a phase-rotated unit vector, which makes time visible in the
 spherical memory representation.
 
-Constitution §4: this is a fast-trace store. Slow consolidation lives in
+this is a fast-trace store. Slow consolidation lives in
 `ConsequenceMemory.consolidate`. The trace buffer here is bounded
 (`max_events`) so it does not grow without limit.
 """
@@ -58,7 +58,7 @@ class SphericalPhaseMemory(nn.Module):
         self.register_buffer("history_weights", weights / weights.sum())
 
         # Rotary frequencies: a small learned-free bank of frequencies
-        # that span the time horizon. We use evenly-spaced frequencies.
+        # that span the time horizon. Evenly-spaced frequencies are used.
         # Inv-Normalized so the lowest frequency completes one full period
         # at the maximum time horizon.
         freqs = torch.linspace(0.5, 4.0, rotary_freqs, dtype=torch.float32)
@@ -126,9 +126,9 @@ class SphericalPhaseMemory(nn.Module):
             return self.empty_trace.to(device).unsqueeze(0)
 
         # Build per-event time weight using rotary phase cos(w t).
-        # Per Action-Sphere RTCM memo §3, time-as-phase. We use the
+        # Per RTCM design, time-as-phase. The trace uses the
         # cosine of the phase difference between event i and "now".
-        # v3.1: blend with a uniform time weight (0.5 each) to avoid
+        # blend with a uniform time weight (0.5 each) to avoid
         # breaking the existing windowed trace. The rotary phase is
         # a gentle modulator, not a complete replacement.
         cur_t = self.timestamps[-1].item()
@@ -155,9 +155,9 @@ class SphericalPhaseMemory(nn.Module):
         return project_to_sphere(weighted_sum)
 
     def add_phase_step(self, t_offset=0):
-        """v3 convenience: bump the global time without changing h.
+        """convenience: bump the global time without changing h.
 
-        Used in select_action when we want to advance the time rotor
+        Used in select_action to advance the time rotor
         independent of a state update (e.g. on motor release).
         """
         self.t += 1

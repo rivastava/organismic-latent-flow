@@ -62,3 +62,60 @@ def log_map_sphere(x, y, eps=1e-8):
         torch.zeros_like(y_proj_norm),
     )
     return project_to_tangent(x, y_proj * scale)
+
+
+def antipodal(x, y, eps: float = 1e-4):
+    """True when x and y are (numerically) antipodal on the unit sphere.
+
+    Parallel transport along a geodesic is undefined when the source and
+    target are exact opposites: every great circle through both points is a
+    valid path, so the transported tangent is not unique.
+    """
+    dot = (x * y).sum(dim=-1)
+    return bool((dot <= -1.0 + eps).all())
+
+
+def parallel_transport_sphere(x, y, v, eps: float = 1e-8):
+    """Parallel transport the tangent vector ``v`` (at ``x``) to the tangent
+    space at ``y``, both on the unit sphere S^(d-1).
+
+    Closed form along the geodesic from x to y:
+
+        û  = (y - <x,y> x) / sin(theta)          # unit tangent at x toward y
+        v_par   = <v, û> û                         # component along transport dir
+        v_perp  = v - v_par                        # component in orthogonal complement
+        û' = -sin(theta) x + cos(theta) û         # transported direction at y
+        T(v) = <v, û> û'  +  v_perp                # v_perp is parallel-invariant
+
+    The result is projected back onto the tangent at y for numerical safety.
+    Raises ValueError if x and y are (numerically) antipodal.
+    """
+    x = project_to_sphere(x)
+    y = project_to_sphere(y)
+    if antipodal(x, y):
+        raise ValueError(
+            "parallel transport undefined for antipodal points (non-unique geodesic)"
+        )
+    dot = (x * y).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    sin_theta = torch.sqrt((1.0 - dot * dot).clamp_min(0.0))
+    cos_theta = dot
+    # Degenerate (x ~ y): transport is the identity on the tangent at y.
+    if bool((sin_theta < eps).all()):
+        return project_to_tangent(y, v)
+    u_hat = (y - cos_theta * x) / sin_theta           # unit tangent at x toward y
+    s = (v * u_hat).sum(dim=-1, keepdim=True)           # <v, û>
+    v_par = s * u_hat
+    v_perp = v - v_par                                  # invariant complement
+    u_prime = -sin_theta * x + cos_theta * u_hat        # transported direction at y
+    # Parallel transport: the along-geodesic component moves with the geodesic
+    # direction; the orthogonal complement is invariant under the transport.
+    transported = s * u_prime + v_perp
+    return project_to_tangent(y, transported)
+
+
+def angular_distance(a, b, eps: float = 1e-8):
+    """Great-circle (angular) distance between two points on the unit sphere."""
+    a = project_to_sphere(a)
+    b = project_to_sphere(b)
+    cos = (a * b).sum(dim=-1).clamp(-1.0, 1.0)
+    return torch.acos(cos)

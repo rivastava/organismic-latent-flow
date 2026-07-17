@@ -5,7 +5,7 @@ class VetoBoundary(nn.Module):
     """
     VetoBoundary acts as a viability filter over actions.
 
-    v0.3.2.10 — Boundary Deformation Risk.
+    Boundary Deformation Risk.
     The Veto estimates action-attributable boundary deformation risk
     independently from FiLM-modulated consequence value.
 

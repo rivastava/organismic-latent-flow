@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from dataclasses import replace
 
 from olf.flow import LTCFlow
 from olf.spm import SphericalPhaseMemory
@@ -20,6 +21,8 @@ from olf.events import entity_feature_event_mask
 from olf.geometry import exponential_map, log_map_sphere, project_to_tangent
 from olf.prospective import ProspectiveEventField
 from olf.prospective_memory import ProspectiveEventMemory
+from olf.ghosts.config import GhostConfig
+from olf.ghosts.integration import GhostIntegration
 
 class Organism(nn.Module):
     """
@@ -58,6 +61,8 @@ class Organism(nn.Module):
         use_prospective_event_memory=True,
         use_situated_prospective_keys=True,
         use_prospective_action_retrieval=True,
+        ghost_mode: str = "off",
+        ghost_config: GhostConfig | None = None,
     ):
         super().__init__()
         
@@ -119,7 +124,7 @@ class Organism(nn.Module):
         self.rtcm = RetrogradeTemporalCausalMemory(latent_dim=latent_dim, action_dim=action_dim)
         self.consequence_memory = ConsequenceMemory(trace_dim=hidden_dim, action_dim=action_dim, latent_dim=latent_dim)
 
-        # v3: motor transformation memory. Stores (before_h, action, after_h,
+        # motor transformation memory. Stores (before_h, action, after_h,
         # success, reward) with explicit delta. InventionGenerator queries
         # this to compose candidate action sequences from previously-observed
         # successful transformations, rather than just replaying old actions.
@@ -146,17 +151,17 @@ class Organism(nn.Module):
         self.invention = InventionGenerator(latent_dim=latent_dim, action_dim=action_dim, hidden_dim=hidden_dim)
         self.motor = MotorCortex()
 
-        # Constitution §12: Readiness gate
+        # Readiness gate
         self.readiness_gate = ReadinessGate()
 
-        # Constitution §13: Diagnostic decay tracker
+        # Diagnostic decay tracker
         self.diagnostic_tracker = DiagnosticDecayTracker()
 
-        # Constitution §6: Attractor field. Goals are attractors in
+        # Attractor field. Goals are attractors in
         # latent space, not symbolic commands.
         self.attractor_field = AttractorField(latent_dim=latent_dim)
 
-        # Action-Sphere RTCM memo §8: Prospective salience gate. Decides
+        # RTCM design: Prospective salience gate. Decides
         # what events to write into long-term memory based on estimated
         # future causal value, not just because they happened.
         self.salience_gate = ProspectiveSalienceGate(latent_dim=latent_dim)
@@ -179,8 +184,8 @@ class Organism(nn.Module):
         )
 
         # Policy model for physical moves (dx, dy, u)
-        # Constitution §6: policy emerges from the latent flow, but for the
-        # v0.1 prototype we use a small MLP head that maps the bound sigma
+        # policy emerges from the latent flow, but for the
+        # prototype uses a small MLP head that maps the bound sigma
         # plus the latent state to a 3-dim action (dx, dy, u). The `u` action
         # is treated as continuous in [-1, 1] for likelihood computation but
         # the env can threshold it (e.g. > 0.5 = use).
@@ -201,7 +206,7 @@ class Organism(nn.Module):
         self.warmup_episodes = 30
         self.episode_count = 0
 
-        # v0.3.2: stateful recoupling obligation. When a world-mutating
+        # stateful recoupling obligation. When a world-mutating
         # action is released, recouple_required becomes True. The next
         # real observation/consequence satisfies the obligation, and
         # readiness is restored. Do NOT fake perception inside select_action.
@@ -214,7 +219,7 @@ class Organism(nn.Module):
         self._h_at_action = None
         self._prefetched_obs = None
 
-        # v0.3.1.2: diagnostic instrumentation. When diag_mode is True, the
+        # diagnostic instrumentation. When diag_mode is True, the
         # organism records per-step telemetry into diag_buffer for the
         # diagnostic report. Forward pass, gradient flow, and any
         # trainable parameters are unchanged. Default is off.
@@ -236,10 +241,36 @@ class Organism(nn.Module):
             "prospective_events_seen", torch.zeros((), dtype=torch.long)
         )
 
+        # role-free ghost population integration. The organism OWNS the
+        # ghost subsystem; it is constructed with a reference to this Organism
+        # so every cognitive operation (FLC, transfer, boundary, motor,
+        # semantics) is the organism's own instance. When ghost_mode == "off"
+        # no subsystem is created and behavior is byte-identical to before.
+        self.ghost_mode = ghost_mode
+        if ghost_config is None:
+            cfg = GhostConfig(
+                ghost_mode=ghost_mode,
+                latent_dim=latent_dim,
+                action_dim=action_dim,
+            )
+        else:
+            cfg = replace(
+                ghost_config,
+                ghost_mode=ghost_mode,
+                latent_dim=latent_dim,
+                action_dim=action_dim,
+            )
+        self.ghost_config = cfg
+        self.ghost: GhostIntegration | None = None
+        if cfg.active:
+            self.ghost = GhostIntegration(cfg, organism=self)
+        self._ghost_token = None
+        self._ghost_base_future = None
+
         self.reset_state()
         
     def reset_diag(self):
-        """v0.3.1.2: reset the diagnostic buffer. Called by the diagnostic
+        """reset the diagnostic buffer. Called by the diagnostic
         runner between episodes. Telemetry only — no behavior change.
         """
         self.diag_buffer = []
@@ -249,7 +280,7 @@ class Organism(nn.Module):
             self.motor_memory._query_count = 0
 
     def self_state_swap_probe(self, obs):
-        """v0.3.2.5: measure whether self_state changes downstream behavior.
+        """measure whether self_state changes downstream behavior.
 
         Binds the same observation twice — once with the original self_state
         and once with the flipped self_state (1.0 - ss, clamped to [0,1]).
@@ -290,7 +321,7 @@ class Organism(nn.Module):
             uncertainty_diff = float((cons_orig["uncertainty"] - cons_flip["uncertainty"]).abs().mean().item())
             action_diff = float((a_orig - a_flip).reshape(-1).norm().item())
 
-            # v0.3.2.6: compute affordance_pressure for both self_states
+            # compute affordance_pressure for both self_states
             af_orig = float((cons_orig["value"].squeeze(-1) - cons_orig["terminal_risk"].squeeze(-1) - cons_orig["uncertainty"].squeeze(-1)).mean().item())
             af_flip = float((cons_flip["value"].squeeze(-1) - cons_flip["terminal_risk"].squeeze(-1) - cons_flip["uncertainty"].squeeze(-1)).mean().item())
             affordance_pressure_diff = float(abs(af_orig - af_flip))
@@ -301,7 +332,7 @@ class Organism(nn.Module):
             risk_o = cons_orig["terminal_risk"].max().item()
             closure_p = self_state.squeeze(0).cpu().numpy()
             diag_decay = self.diagnostic_tracker.get_decay()
-            # v0.3.2.8: need_pressure for readiness (not risk)
+            # need_pressure for readiness (not risk)
             need_o = float(self_state.squeeze(0).max().item())
             readiness_o = self.readiness_gate.compute_readiness(
                 self.prev_veto_verdict, need_o, affordance_pressure=af_orig
@@ -317,7 +348,7 @@ class Organism(nn.Module):
 
             uncertainty_f = cons_flip["uncertainty"].mean().item()
             risk_f = cons_flip["terminal_risk"].max().item()
-            # v0.3.2.8: need_pressure for readiness (not risk)
+            # need_pressure for readiness (not risk)
             need_f = float(self_state_flip.squeeze(0).max().item())
             readiness_f = self.readiness_gate.compute_readiness(
                 self.prev_veto_verdict, need_f, affordance_pressure=af_flip
@@ -405,6 +436,16 @@ class Organism(nn.Module):
         # The veto starts the episode with a clean slate
         self.prev_veto_verdict = "release"
         self._recouple_required = False
+
+        # clear ghost pending-release token and reset the (temporary)
+        # ghost population. The learned reachable-deformation space persists.
+        # An episode reset explicitly aborts any pending release transaction and
+        # records that it did so.
+        self._ghost_reset_aborted_pending = self._ghost_token is not None
+        self._ghost_token = None
+        self._ghost_base_future = None
+        if self.ghost is not None:
+            self.ghost.reset()
         
     def parse_obs(self, obs_tensor):
         """Parses observation vector for arbitrary num_entities.
@@ -770,6 +811,11 @@ class Organism(nn.Module):
 
     def select_action(self, obs, evaluate=False):
         """Steps the OLF organism forward through the full organismic loop."""
+        if self.ghost is not None and self.ghost.has_pending_release:
+            raise RuntimeError(
+                "external consequence must recouple the pending ghost release "
+                "before another action is selected"
+            )
         device = next(self.parameters()).device
         obs_t = torch.FloatTensor(obs).to(device).unsqueeze(0)
 
@@ -797,10 +843,10 @@ class Organism(nn.Module):
             x_flow = torch.cat([obs_t, spm_trace], dim=-1)
             self.h = self.flow(x_flow, self.h.to(device))
 
-        # Constitution §6: The attractor field is maintained as a
+        # The attractor field is maintained as a
         # diagnostic mechanism (which regions of latent space are
         # preferred). Per the brief, goals are attractors, not commands.
-        # v3.1.1: we apply a very small attractor bias (0.001) but only
+        # a small attractor bias (0.001) applies only
         # after the organism has accumulated some experience
         # (`self._steps_seen > 50`). This lets the attractor guide
         # long-horizon behavior without destabilizing early training.
@@ -821,10 +867,16 @@ class Organism(nn.Module):
         self._h_at_action = self.h.clone().detach()
         self._entity_feats_at_action = entities_feats.detach().clone()
 
-        # 3. Situated Semantics Binding (Constitution §3)
+        # transport persistent ghosts to the current real anchor. Runs
+        # only when a ghost subsystem exists; purely detached memory update.
+        if self.ghost is not None:
+            with torch.no_grad():
+                self.ghost.begin_step(self.h)
+
+        # 3. Situated Semantics Binding
         sigma_t = self.semantics.bind(spm_trace, entities_pos, entities_feats, context, self_state)
 
-        # v0.3.1.2 diagnostic: σ self-state-flip test. Bind twice with
+        # diagnostic: σ self-state-flip test. Bind twice with
         # self_state flipped in [-1, 1] bounds (no autograd, no
         # behavior change) and measure the L2 distance between the
         # two bound sigmas. This is the constitutional measure of
@@ -836,7 +888,7 @@ class Organism(nn.Module):
                     spm_trace, entities_pos, entities_feats, context, self_state_flip
                 )
                 sigma_diff = (sigma_t - sigma_flip).reshape(-1).norm().item()
-                # v0.3.2.5: FiLM parameter norms + gamma/beta stats
+                # FiLM parameter norms + gamma/beta stats
                 film_w_norm = float(self.semantics.film_gen.weight.norm().item())
                 film_b_norm = float(self.semantics.film_gen.bias.norm().item())
                 gb = self.semantics.film_gen(self_state)
@@ -897,13 +949,13 @@ class Organism(nn.Module):
         )
         closure_pressure = self_state.squeeze(0).cpu().numpy()
 
-        # v0.3.2.9: Compute need_pressure from self_state.
+        # Compute need_pressure from self_state.
         # Need is not danger — it drives urgency, not rollback.
         # need_pressure = max(hunger, fatigue): the dominant unresolved need.
         with torch.no_grad():
             need_pressure = float(self_state.squeeze(0).max().item())
 
-        # v0.3.2.6: Compute affordance_pressure from consequence predictions.
+        # Compute affordance_pressure from consequence predictions.
         # Per-entity: affordance_i = value_i - risk_i - uncertainty_i
         # Scalar summary: mean over entities.
         with torch.no_grad():
@@ -913,7 +965,7 @@ class Organism(nn.Module):
                 * float(entity_affordance.mean().item())
             )
 
-        # v0.3.1.2 diagnostic: record impasse state and pre-arbitration
+        # diagnostic: record impasse state and pre-arbitration
         # uncertainty/risk for the diagnostic report. Logging only.
         if self.diag_mode:
             def _diag_scalar(name):
@@ -940,27 +992,27 @@ class Organism(nn.Module):
             })
             self.diag_episode += 1
 
-        # Constitution §13: Get diagnostic decay (kept as separate signal, NOT conflated with closure)
+        # Get diagnostic decay (kept as separate signal, NOT conflated with closure)
         diag_decay = self.diagnostic_tracker.get_decay()
 
-        # 5. Safety steering & action release constraint (Constitution §7)
+        # 5. Safety steering & action release constraint
         veto_verdict = self.prev_veto_verdict
 
-        # Constitution §12: Compute readiness (separate from action pressure)
-        # v0.3.2.8: readiness uses need_pressure (urgency from self_state),
+        # Compute readiness (separate from action pressure)
+        # readiness uses need_pressure (urgency from self_state),
         # NOT risk (which is terminal_risk from the Veto). Need is pressure,
         # not danger.
         readiness = self.readiness_gate.compute_readiness(
             veto_verdict, need_pressure, affordance_pressure=affordance_pressure
         )
 
-        # v0.3.2.2: if recoupling is required, reduce readiness to bias
+        # if recoupling is required, reduce readiness to bias
         # mode selection toward Inspect/Recouple. This is a within-regime
         # modulation — it does not replace the verdict cascade.
         if self._recouple_required:
             readiness = readiness * 0.3
 
-        # 6. Mode arbitration (Constitution §11: soft biases, not hard overrides)
+        # 6. Mode arbitration
         mode, mode_probs = self.arbitrator(
             self.h, uncertainty, impasse_detected, risk, closure_pressure,
             self.recent_consequence_val,
@@ -970,17 +1022,17 @@ class Organism(nn.Module):
             recoupling_required=self._recouple_required
         )
 
-        # Constitution §13: Update diagnostic decay tracker
+        # Update diagnostic decay tracker
         self.diagnostic_tracker.update(uncertainty, mode.item())
 
-        # 7. Invention generation (under impasse, Constitution §10)
-        # v0.3.1.2: when diag_mode is on, attach the organism's diag_buffer
+        # 7. Invention generation under impasse.
+        # when diag_mode is on, attach the organism's diag_buffer
         # to the motor_memory as diag_log_target so per-query telemetry
         # is collected during the invention call.
         if mode[0] == 2:
             if self.diag_mode:
                 self.motor_memory.diag_log_target = self.diag_buffer
-            # v0.3.2: track motor memory retrieval for causal influence test
+            # track motor memory retrieval for causal influence test
             self._mm_retrieved = (self.motor_memory is not None and self.motor_memory.size() > 0)
             a_cand = self.invention(self.h, sigma_t, self.consequence_memory, motor_memory=self.motor_memory)
             if self.diag_mode:
@@ -989,9 +1041,42 @@ class Organism(nn.Module):
             a_cand = a_cand_init
             self._mm_retrieved = False
 
-        # v0.3.1.2 diagnostic: record invention path activation and
+        # ghost set-valued candidate correction. The ghost subsystem uses
+        # the organism's OWN FLC transfer, boundary, and reachable space; the
+        # organism still owns the final boundary constraint and motor release
+        # below, so mode/readiness/verdict/viability remain authoritative. In
+        # observe mode propose returns a zero delta (no influence) but still
+        # computes the baseline future used for contrastive evidence at recouple.
+        ghost_diag = None
+        ghost_influenced = False
+        if self.ghost is not None and self.ghost.config.active:
+            ghost_delta, ghost_diag, ghost_influenced, base_future, ghost_token = (
+                self.ghost.propose(
+                    sigma_flat=flat_embeds,
+                    self_state=self_state,
+                    sigma_t=sigma_t,
+                    base_action=a_cand,
+                )
+            )
+            if ghost_influenced and ghost_delta is not None:
+                # Add the detached, non-parametric correction on top of the
+                # policy candidate (preserves the policy-gradient graph of
+                # a_cand_init, exactly like the veto boundary does downstream).
+                a_cand = a_cand + ghost_delta
+            # A pending release token must never be overwritten by a later
+            # (non-recoupled) selection. The passive baseline is recorded only
+            # when no pending release already owns one.
+            if ghost_token is not None and self._ghost_token is None:
+                self._ghost_token = ghost_token
+                self._ghost_base_future = base_future
+            elif self._ghost_token is None:
+                self._ghost_base_future = base_future
+            ghost_diag = dict(ghost_diag or {})
+            ghost_diag["ghost_influenced"] = bool(ghost_influenced)
+
+        # diagnostic: record invention path activation and
         # candidate action norms (logging only).
-        # v0.3.2: add motor memory retrieval telemetry.
+        # add motor memory retrieval telemetry.
         if self.diag_mode:
             self.diag_buffer.append({
                 "invention_invoked": bool(mode[0] == 2),
@@ -1003,8 +1088,8 @@ class Organism(nn.Module):
         # Re-predict consequences with actual action proposal
         consequences_final = self.semantics.predict_consequences(sigma_t, a_cand)
 
-        # 8. Veto boundary constraint (Constitution §7: viability pressure, not binary)
-        # v0.3.2.10 — Boundary Deformation Risk.
+        # 8. Veto boundary constraint
+        # Boundary Deformation Risk.
         # The Veto uses its own B_psi(h, a, dh_pred) to estimate action-attributable
         # boundary deformation risk. This is INDEPENDENT of FiLM-modulated terminal_risk.
         # Consequence model answers: "What value does this situation imply?"
@@ -1014,9 +1099,9 @@ class Organism(nn.Module):
         )
         self.prev_veto_verdict = veto_verdict
 
-        # v0.3.1.2 diagnostic: record veto verdict and action-norms
+        # diagnostic: record veto verdict and action-norms
         # before/after veto for the calibration analysis.
-        # v0.3.2.10: add B_psi boundary risk signals (veto_boundary_risk, risk_baseline,
+        # add B_psi boundary risk signals (veto_boundary_risk, risk_baseline,
         # consequence_terminal_risk, danger).
         if self.diag_mode:
             a_pre_norm = float(a_cand.detach().norm().item())
@@ -1037,22 +1122,22 @@ class Organism(nn.Module):
                 "consequence_terminal_risk": veto_diag.get("consequence_terminal_risk", 0.0),
             })
 
-        # Constitution §12: Readiness-modulated motor release
-        # v0.3.2.9: readiness uses need_pressure, not terminal_risk.
+        # Readiness-modulated motor release
+        # readiness uses need_pressure, not terminal_risk.
         final_readiness = self.readiness_gate.compute_readiness(
             veto_verdict, need_pressure, affordance_pressure=affordance_pressure
         )
 
-        # v0.3.2.2: readiness_factor scales action WITHIN each verdict regime.
+        # readiness_factor scales action WITHIN each verdict regime.
         # Must be computed BEFORE motor release so it can be passed through.
         readiness_factor = 0.3 if self._recouple_required else 1.0
 
-        # 9. Motor release arbitration (v0.3.2.2: readiness-scaled within regime)
+        # 9. Motor release arbitration (readiness-scaled within regime)
         act_np = a_steered.squeeze(0).cpu().detach().numpy()
         a_final = self.motor.process_release(act_np, veto_verdict, mode.item(), viability, readiness_factor)
 
-        # v0.3.1.2 diagnostic: record motor release action and suppression.
-        # v0.3.2.2: add readiness scaling diagnostics.
+        # diagnostic: record motor release action and suppression.
+        # add readiness scaling diagnostics.
         if self.diag_mode:
             a_pre_readiness_norm = float(np.linalg.norm(a_steered.squeeze(0).cpu().detach().numpy()))
             a_post_readiness_norm = float(np.linalg.norm(a_final))
@@ -1069,7 +1154,7 @@ class Organism(nn.Module):
         # 10. State trace updates
         # RTCM gets the (h_t, a_t, h_{t+1}, consequence) transition so its R_Δ
         # operator can learn the cause→effect direction.
-        # We log the current step's transition. The consequence is filled in
+        # The current step transition is logged. The consequence is filled in
         # retroactively by learn_consequence (training loop), and the R_Δ effect
         # delta is computed from (h_next − h_t) once h_{t+1} is known next call.
         self.spm.update(self.h)
@@ -1081,14 +1166,20 @@ class Organism(nn.Module):
         )
         self.impasse_detector.add_step(agent_pos.squeeze(0).cpu().numpy(), a_final)
 
-        # Constitution §12: Update readiness gate with flow state
+        # Update readiness gate with flow state
         self.readiness_gate.update(self.h, received_consequence=False)
 
         # Track for consequence learning
         self.last_sigma = sigma_t.clone().detach()
         self.last_action = a_final.copy()
+        if self.ghost is not None and self._ghost_token is not None:
+            self.ghost.finalize_release(
+                self._ghost_token,
+                real_prev=self._h_at_action,
+                released_action=a_final,
+            )
         
-        # v0.3.2: set recouple obligation when verdict demands it
+        # set recouple obligation when verdict demands it
         if veto_verdict in ("recouple", "rollback"):
             self._recouple_required = True
         
@@ -1109,6 +1200,7 @@ class Organism(nn.Module):
             "consequence_grounding_confidence": grounding_confidence,
             "diagnostic_decay": diag_decay,
             "recouple_required": self._recouple_required,
+            "ghost": ghost_diag,
             "future_horizon": float(flc_diag["future_horizon"].reshape(-1)[0].item()),
             "future_abstraction": float(flc_diag["future_abstraction"].reshape(-1)[0].item()),
             "future_alignment": float(flc_diag["future_alignment"].reshape(-1)[0].item()),
@@ -1160,7 +1252,7 @@ class Organism(nn.Module):
     ):
         """Recouple to an outcome and optionally store persistent traces.
 
-        The trace follows Constitution §4: (situation_before, action, situation_after, consequence).
+        The trace follows (situation_before, action, situation_after, consequence).
         - situation_before: snapshot of h BEFORE the action that produced this consequence
         - situation_after: current h (the state that resulted)
         - action: the action that bridged before and after
@@ -1170,7 +1262,7 @@ class Organism(nn.Module):
         training sees the actual per-step consequence (not just the final
         episode outcome).
         """
-        # v0.3.1.2 diagnostic: record consequence signal and any
+        # diagnostic: record consequence signal and any
         # MotorMemory write. Logging only.
         if self.diag_mode:
             self.diag_buffer.append({
@@ -1190,7 +1282,14 @@ class Organism(nn.Module):
                 [reward, float(was_lethal), hunger_delta, fatigue_delta],
                 dtype=np.float32,
             )
-            s_t = self._h_at_action if self._h_at_action is not None else self.h
+            ghost_context = None
+            if self.ghost is not None and self._ghost_token is not None:
+                ghost_context = self.ghost.pending_context(self._ghost_token)
+            s_t = (
+                ghost_context["real_prev"]
+                if ghost_context is not None
+                else self._h_at_action if self._h_at_action is not None else self.h
+            )
 
             # Recouple through the actual next observation before writing any
             # transformation memory. Legacy callers may omit next_obs; they keep
@@ -1203,6 +1302,27 @@ class Organism(nn.Module):
             self.last_observed_effect = log_map_sphere(
                 s_t.detach(), s_after.detach()
             )
+
+            # ghost external recoupling. The pending-release token issued
+            # by an influenced select_action is consumed exactly once here; an
+            # arbitrary latent cannot satisfy recoupling. In observe mode the
+            # token is None and evidence is still updated (detached).
+            if self.ghost is not None and self.ghost.config.active:
+                with torch.no_grad():
+                    ghost_report = self.ghost.recouple_token(
+                        token=self._ghost_token,
+                        real_prev=s_t.detach(),
+                        observed_anchor=s_after.detach(),
+                        base_future_anchor=(
+                            self._ghost_base_future.detach()
+                            if self._ghost_base_future is not None
+                            else s_t.detach()
+                        ),
+                        released_action=self.last_action,
+                    )
+                if ghost_report.get("updated", False):
+                    self._ghost_token = None
+                    self._ghost_base_future = None
 
             event_mask = torch.zeros(
                 self.num_entities, dtype=torch.bool, device=self.h.device
@@ -1243,7 +1363,7 @@ class Organism(nn.Module):
                 - float(was_lethal)
             )
 
-            # Constitution §6: body relief can establish a preferred latent
+            # body relief can establish a preferred latent
             # region. This uses observed homeostatic deformation, never a task
             # reward or status label. Bounded attractor capacity prevents
             # unbounded writes; prospective consolidation is handled separately.
@@ -1257,7 +1377,7 @@ class Organism(nn.Module):
                     with torch.no_grad():
                         self.attractor_field.create_at(s_after)
 
-            # v3: record the (before_h, action, after_h) transformation into
+            # record the (before_h, action, after_h) transformation into
             # motor_memory. The success flag is 0.0 if lethal, 1.0 otherwise.
             # Reward is the raw reward signal (used for ranking similar
             # transformations in query_similar_action).
@@ -1273,8 +1393,8 @@ class Organism(nn.Module):
                     float(reward),
                 )
 
-            # Constitution §12: Mark that consequence was received (recoupling)
-            # v0.3.2: clear recouple obligation — the next real observation
+            # Mark that consequence was received (recoupling)
+            # clear recouple obligation — the next real observation
             # satisfies the world-mutating action's recoupling requirement.
             self._recouple_required = False
             self.readiness_gate.update(self.h, received_consequence=True)

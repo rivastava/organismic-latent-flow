@@ -1,6 +1,4 @@
-"""benchmarks/code_body_real.py
-
-Real-ish code body per Constitution §20.
+"""A compact code-repair environment with mandatory recoupling.
 
 The organism lives in a tiny "broken program" world:
   - The program is a list of integers (1D bytecode) with a known target.
@@ -17,18 +15,15 @@ The organism lives in a tiny "broken program" world:
 
 The organism must learn the inspect → edit → recouple → test cycle.
 
-Internal representation: per Constitution §8, "actions may look symbolic,
-but internally they must be treated as bodily affordance vectors, not
-planner commands." So we map the 3-dim continuous action (dx, dy, u) to
-a discrete intent:
+The three-dimensional continuous action ``(dx, dy, u)`` maps to a discrete
+environmental effect:
   u > 0.5  → action = edit_code (with strength)
   -0.5 < u < 0.5 → inspect
   u < -0.5 → rollback
   recoupling is enforced if last step was edit: action must be hold
   (which means low dx, dy, neutral u).
 
-Recoupling rule (Constitution §9, non-negotiable):
-  after edit, next step MUST be hold. If not, crash.
+After an edit, the next step must be a hold. Otherwise the program crashes.
 
 This is a real-enough code body to test recoupling, invention (when no
 edit works), and goal-as-attractor (viable programs).
@@ -116,7 +111,7 @@ class CodeBodyRealEnv(BaseBenchmark):
         # organism's "motor" awareness.
         intent, strength = self._action_intent(u)
 
-        # Recoupling enforcement (Constitution §9, non-negotiable).
+        # An edit must be followed by a stationary recoupling step.
         if self.last_action_was_edit and self.recouple_remaining > 0:
             # The next step must be a hold (no movement, no edit).
             is_moving = (abs(dx) > 0.01 or abs(dy) > 0.01)
@@ -179,10 +174,7 @@ class CodeBodyRealEnv(BaseBenchmark):
                 dtype=np.float32,
             )
 
-        # Reward shaping: NOT allowed (Constitution §7). But we can give a
-        # tiny completion reward when the program matches (Constitution §6
-        # attractor: viable state). Plus a soft "stable system" reward via
-        # self_state decay.
+        # Emit reward only when the program reaches the target state.
         reward = 0.0
         if self._program_diff() < 0.01:
             # Program matches target.

@@ -6,7 +6,7 @@ class AbstractionUnseenEnv(BaseBenchmark):
     3. Abstraction over Unseen Objects.
     Tests generalization based on geometric similarity in consequence space.
 
-    v0.3.2: randomize_positions flag for leakage diagnostic.
+    randomize_positions flag for leakage diagnostic.
     When True, entity positions are randomized each episode while features
     are kept fixed. This tests whether the organism uses features or just
     memorizes positions.

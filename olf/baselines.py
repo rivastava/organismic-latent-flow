@@ -117,9 +117,9 @@ class _ExactMemory(nn.Module):
 
 
 class AblatedOrganism(Organism):
-    """OLF Organism with a single constitutional component disabled.
+    """OLF Organism with a single component disabled.
 
-    Supported ablation_type values (matching Constitution §16):
+    Supported ``ablation_type`` values:
         no_memory
         no_spm
         last_observation_only
@@ -155,7 +155,7 @@ class AblatedOrganism(Organism):
         if ablation_type in ("no_consequence_memory", "no_memory"):
             self.consequence_memory = _EmptyMemory(latent_dim=latent_dim)
 
-        # v3: internal ablation — disable motor_memory (the
+        # internal ablation — disable motor_memory (the
         # InventionGenerator's transformation-composition memory).
         if ablation_type == "no_motor_memory":
             self.motor_memory = _EmptyMotorMemory(latent_dim=latent_dim, action_dim=action_dim)
@@ -234,11 +234,11 @@ class AblatedOrganism(Organism):
         if self.ablation_type == "no_closure_pressure":
             closure_pressure = np.zeros_like(closure_pressure)
 
-        # v0.3.2.8: need_pressure = max(hunger, fatigue) — the dominant unresolved need.
+        # need_pressure = max(hunger, fatigue) — the dominant unresolved need.
         # Need is not danger. It drives urgency, not rollback.
         need_pressure = float(self_state.squeeze(0).max().item())
 
-        # v0.3.2.6: compute affordance_pressure from consequence predictions
+        # compute affordance_pressure from consequence predictions
         with torch.no_grad():
             entity_affordance = self._compute_entity_affordance(consequences)
             affordance_pressure = float(entity_affordance.mean().item())
@@ -313,7 +313,7 @@ class AblatedOrganism(Organism):
             veto_verdict = "release"
             viability = soft_scale
         else:
-            # v0.3.2.10 — Boundary Deformation Risk.
+            # Boundary Deformation Risk.
             # The Veto uses its own B_psi(h, a, dh_pred) for boundary risk.
             # No FiLM-based danger computation needed.
             a_steered, veto_verdict, viability, _, danger, _ = self.veto.constrain_release(
@@ -322,7 +322,7 @@ class AblatedOrganism(Organism):
 
         self.prev_veto_verdict = veto_verdict
 
-        # 9. Motor release (v0.3.2.2: readiness_factor passed through)
+        # 9. Motor release (readiness_factor passed through)
         act_np = a_steered.squeeze(0).cpu().detach().numpy()
         # Ablated organisms don't have readiness gate — use 1.0 (no modulation)
         abl_readiness = 1.0
@@ -408,7 +408,7 @@ class AblatedOrganism(Organism):
             return
 
         # 'soft_risk_only' now uses soft action penalty, not reward shaping.
-        # We do NOT modify reward — the penalty was applied in select_action.
+        # Reward remains unchanged; the penalty was applied in select_action.
         super().learn_consequence(
             reward,
             was_lethal,
