@@ -33,6 +33,7 @@ action delta (no influence, no gradient, no RNG/training-order change).
 import torch
 
 from olf.geometry import (
+    antipodal,
     exponential_map,
     log_map_sphere,
     parallel_transport_sphere,
@@ -302,6 +303,7 @@ class GhostIntegration:
 
         ghost_idx = list(range(len(self.population)))
         weights = torch.zeros(len(ghost_idx))
+        credibility_mass = 0.0
         combined_action = torch.zeros_like(base_action[0])
         reachable_flags = []
         ghost_indices = []
@@ -313,6 +315,19 @@ class GhostIntegration:
             with torch.no_grad():
                 # Signature target (fixed observed deformation).
                 target = g.predicted_anchor(step)
+                if bool(antipodal(h, target).any()):
+                    reachable_flags.append(False)
+                    diag.setdefault("candidates", []).append({
+                        "ghost_index": g_index,
+                        "action_conditioned": False,
+                        "action_support_known": False,
+                        "reachable": False,
+                        "reachability_residual": None,
+                        "motor_valid": False,
+                        "inverse_defined": False,
+                        "undefined_reason": "antipodal_target",
+                    })
+                    continue
                 correction = self.organism.flc.transfer.inverse_correction(
                     h.unsqueeze(0), target.unsqueeze(0)
                 )[0]
@@ -331,6 +346,19 @@ class GhostIntegration:
                 if len(g.transfer_actions) >= self.config.min_action_evidence:
                     pred_tan = g.transfer_predict(cand_action0, h)
                     target2 = exponential_map(h, pred_tan * step)
+                    if bool(antipodal(h, target2).any()):
+                        reachable_flags.append(False)
+                        diag.setdefault("candidates", []).append({
+                            "ghost_index": g_index,
+                            "action_conditioned": True,
+                            "action_support_known": True,
+                            "reachable": False,
+                            "reachability_residual": None,
+                            "motor_valid": False,
+                            "inverse_defined": False,
+                            "undefined_reason": "antipodal_action_target",
+                        })
+                        continue
                     correction2 = self.organism.flc.transfer.inverse_correction(
                         h.unsqueeze(0), target2.unsqueeze(0)
                     )[0]
@@ -361,12 +389,16 @@ class GhostIntegration:
                 "reachable": reachable,
                 "reachability_residual": res,
                 "motor_valid": motor_valid,
+                "inverse_defined": True,
             })
 
             if self.config.random_routing:
                 w = float(torch.rand((), generator=self._rng)) + 1e-8
             else:
-                w = max(float(g.credibility), 1e-8)
+                credibility = max(float(g.credibility), 0.0)
+                grounding = max(float(g.grounding), 0.0)
+                credibility_mass += credibility
+                w = credibility * grounding
             weights[local_i] = w
             combined_action = combined_action + w * cand_action
             ghost_indices.append(g_index)
@@ -374,7 +406,9 @@ class GhostIntegration:
         total = float(weights.sum())
         diag["reachable_count"] = int(sum(reachable_flags))
         diag["weights"] = [float(w) for w in weights]
-        diag["routing"] = "random" if self.config.random_routing else "credibility"
+        diag["routing"] = (
+            "random" if self.config.random_routing else "grounded_credibility"
+        )
         diag["motor_valid_fraction"] = float(motor_valid_count(diag))
         diag["ghost_count_influencing"] = len(ghost_indices)
 
@@ -385,9 +419,17 @@ class GhostIntegration:
 
         combined_action = combined_action / total
         combined_action = torch.clamp(combined_action, -1.0, 1.0)
+        support_amplitude = (
+            1.0
+            if self.config.random_routing
+            else min(1.0, total / max(credibility_mass, 1e-8))
+        )
         # Delta relative to the ordinary OLF candidate (the unmodified path).
-        delta = (combined_action - base_action[0]).reshape(1, -1)
+        delta = (
+            support_amplitude * (combined_action - base_action[0])
+        ).reshape(1, -1)
         diag["influenced"] = True
+        diag["support_amplitude"] = float(support_amplitude)
         return delta, diag, True, ghost_indices
 
     def _centroid_before_inverse(

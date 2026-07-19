@@ -5,7 +5,7 @@ rollout / rehearsal can never increase grounding or evidence support.
 
 Grounding is CONTRASTIVE: a ghost earns grounding only when it predicts the
 recoupled observation better than the organism's own passive / current-flow
-baseline (the FLC base future latent) by a calibrated uncertainty margin.
+baseline (the FLC base future latent).
 Predicting worse than the baseline never increases grounding and reduces
 credibility. A maximally wrong ghost therefore gains no grounding.
 """
@@ -68,18 +68,18 @@ def update_after_recoupling(
     """Update role-free state from an *external* observation only.
 
     Contrastive evidence against the organism's passive baseline:
-      margin    = clamp(uncertainty, 0.05, 1.0) * 0.5   (calibrated by uncertainty)
-      positive  = relu(baseline_err - err - margin)     (ghost clearly beats baseline)
-      negative  = relu(err - baseline_err - margin)     (baseline clearly beats ghost)
+      advantage = baseline_err - err
+      positive  = relu(advantage)       (ghost predicts better than baseline)
+      negative  = relu(-advantage)      (baseline predicts better than ghost)
 
     Grounding rises ONLY with positive evidence. Credibility rises with
     positive evidence and falls with negative evidence. Internal rollout can
     never call this; grounding/evidence are manufactured only here.
     """
     err = predictive_error(ghost, observed_anchor, step)
-    margin = torch.clamp(ghost.uncertainty, 0.05, 1.0) * 0.5
-    positive = torch.relu(baseline_err - err - margin)
-    negative = torch.relu(err - baseline_err - margin)
+    advantage = baseline_err - err
+    positive = torch.relu(advantage)
+    negative = torch.relu(-advantage)
 
     new_ground = torch.clamp(ghost.grounding + learning_rate * positive, 0.0, 1.0)
     new_cred = torch.clamp(

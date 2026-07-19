@@ -11,6 +11,7 @@ Malformed, stale, and out-of-order release transactions fail loudly.
 
 import torch
 import numpy as np
+import pytest
 
 from olf.geometry import (
     antipodal,
@@ -360,6 +361,25 @@ def test_better_than_baseline_increases_grounding():
     assert float(g2.grounding) > float(g.grounding)
 
 
+def test_small_external_predictive_advantage_earns_proportional_grounding():
+    anchor = project_to_sphere(torch.randn(16))
+    tangent = 0.1 * project_to_tangent(anchor, torch.randn(16))
+    g = make_ghost(anchor, tangent, grounding=0.0, uncertainty=1.0)
+    observed = g.predicted_anchor(1.0)
+    offset = project_to_tangent(observed, torch.randn(16))
+    baseline = exponential_map(observed, 0.01 * offset / offset.norm())
+    baseline_err = baseline_error(baseline, observed)
+    g2 = update_after_recoupling(
+        g,
+        observed,
+        step=1.0,
+        baseline_err=baseline_err,
+        learning_rate=0.5,
+    )
+    expected = 0.5 * float(baseline_err)
+    assert float(g2.grounding) == pytest.approx(expected, rel=1e-4, abs=1e-6)
+
+
 def test_repeated_contradiction_negative_evidence():
     g = _ghost_with(grounding=0.2, cred=0.6, unc=0.1, pos=0.0, neg=0.0)
     obs = project_to_sphere(torch.randn(16))
@@ -459,19 +479,18 @@ def test_no_duplicate_parameters_in_state_dict_or_optimizer():
         assert len(optimizer_ids) == len(set(optimizer_ids))
 
 
-def test_ungrounded_ghost_can_influence():
+def test_ungrounded_ghost_remains_observational():
     org = _org("influence")
     obs = torch.randn(18).numpy()
     org.select_action(obs, evaluate=True)
     org.learn_consequence(0.0, 0.0, 0.0, 0.0, next_obs=obs)
     assert len(org.ghost.population) == 1
     assert float(org.ghost.population[0].grounding) == 0.0
-    a, info = org.select_action(obs, evaluate=True)
+    _a, info = org.select_action(obs, evaluate=True)
     weights = (info["ghost"] or {}).get("weights", [])
-    # Grounding remains telemetry and does not suppress participation.
-    for w in weights:
-        assert w > 0.0
-    assert (info["ghost"] or {}).get("ghost_influenced")
+    assert all(weight == 0.0 for weight in weights)
+    assert not (info["ghost"] or {}).get("ghost_influenced")
+    assert org._ghost_token is None
 
 
 # ---- zero ghosts / only ungrounded ghosts -> zero influence --------
@@ -491,7 +510,7 @@ def test_zero_ghosts_no_influence():
     assert np.allclose(a, a_off, atol=0.0)
 
 
-def test_only_ungrounded_ghosts_still_influence():
+def test_only_ungrounded_ghosts_produce_zero_influence():
     org = _org("influence")
     org.reset_state()
     obs = torch.randn(18).numpy()
@@ -500,9 +519,27 @@ def test_only_ungrounded_ghosts_still_influence():
     assert len(org.ghost.population) == 1
     assert float(org.ghost.population[0].grounding) == 0.0
     _, info = org.select_action(obs, evaluate=True)
+    assert not (info["ghost"] or {}).get("ghost_influenced")
+    assert org._ghost_token is None
+    assert all(weight == 0.0 for weight in info["ghost"].get("weights", []))
+
+
+def test_grounding_sets_continuous_influence_amplitude():
+    org = _org("influence", ablation="no_reachability")
+    anchor = project_to_sphere(torch.randn(16))
+    tangent = 0.1 * project_to_tangent(anchor, torch.randn(16))
+    org.ghost.population.append(
+        make_ghost(
+            anchor,
+            tangent,
+            grounding=0.25,
+            credibility=1.0,
+            evidence_support=0.25,
+        )
+    )
+    _, info = org.select_action(torch.randn(18).numpy(), evaluate=True)
     assert (info["ghost"] or {}).get("ghost_influenced")
-    assert org._ghost_token is not None
-    assert all(weight > 0.0 for weight in info["ghost"].get("weights", []))
+    assert info["ghost"]["support_amplitude"] == pytest.approx(0.25)
 
 
 # ---- transactional token ownership --------------------------------
@@ -684,7 +721,9 @@ def test_boundary_eval_after_warmup_no_exception():
 # ---- action-conditioned evidence binds action to consequence ------
 def test_signature_path_operates_before_action_conditioned_evidence():
     org = _org("influence", ablation="no_reachability")
-    g = make_ghost(torch.randn(16), torch.randn(16), grounding=1.0,
+    anchor = project_to_sphere(torch.randn(16))
+    tangent = 0.1 * project_to_tangent(anchor, torch.randn(16))
+    g = make_ghost(anchor, tangent, grounding=1.0,
                    credibility=1.0, evidence_support=1.0)
     # Only ONE evidence pair -> below min_action_evidence (2).
     g = g.add_action_evidence(g.anchor, torch.randn(3), torch.randn(16))
@@ -693,6 +732,28 @@ def test_signature_path_operates_before_action_conditioned_evidence():
     a, info = org.select_action(obs, evaluate=True)
     assert (info["ghost"] or {}).get("ghost_influenced")
     assert info["ghost"]["candidates"][0]["action_conditioned"] is False
+
+
+def test_antipodal_ghost_candidate_is_undefined_not_fatal():
+    org = _org("influence", ablation="no_reachability")
+    h = project_to_sphere(torch.randn(16))
+    tangent = project_to_tangent(h, torch.randn(16))
+    tangent = tangent / tangent.norm() * torch.pi
+    org.ghost.population.append(
+        make_ghost(h, tangent, grounding=1.0, credibility=1.0)
+    )
+    delta, diag, influenced, indices = org.ghost._influence(
+        h,
+        torch.zeros(1, 1),
+        torch.zeros(1, 2),
+        torch.zeros(1, 3),
+        {},
+    )
+    assert not influenced
+    assert indices == []
+    assert torch.equal(delta, torch.zeros_like(delta))
+    assert diag["candidates"][0]["inverse_defined"] is False
+    assert diag["candidates"][0]["undefined_reason"] == "antipodal_target"
 
 
 def test_released_action_bound_to_consequence():
@@ -848,7 +909,7 @@ def test_real_env_ghost_assay_seed0():
 
     Asserts: first action has no ghost influence; first evidence may create an
     ungrounded trajectory; influence starts only after positive contrastive
-    support and sufficient action-conditioned reachability; every influence has
+    support; action-conditioned reachability remains diagnostic; every influence has
     exactly one successful external recoupling; no pending transaction is
     overwritten; population stays within capacity; actions/latents finite;
     boundary warmup-off path runs; final diagnostics include positive/negative

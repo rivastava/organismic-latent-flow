@@ -73,7 +73,7 @@ class GhostConfig:
     reachability_threshold: float = 0.5
 
     # Minimum evidence for refining a signature continuation with the learned
-    # action-conditioned transfer map. Participation itself is unconditional.
+    # action-conditioned transfer map. External grounding controls participation.
     min_action_evidence: int = 2
 
     # Recoupling geometry step used to lift a tangent deformation to a point.
