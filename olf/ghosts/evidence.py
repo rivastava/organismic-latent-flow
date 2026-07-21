@@ -23,17 +23,23 @@ from .diagnostics import finite_or_raise
 from .trajectory import GhostTrajectory
 
 
-def predicted_anchor(ghost: GhostTrajectory, step: float) -> torch.Tensor:
-    return ghost.predicted_anchor(step)
+def predicted_anchor(
+    ghost: GhostTrajectory,
+    step: float,
+    action: torch.Tensor | None = None,
+    anchor: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return ghost.predicted_anchor(step, action=action, anchor=anchor)
 
 
 def predictive_error(ghost: GhostTrajectory, observed_anchor: torch.Tensor,
-                     step: float) -> torch.Tensor:
+                     step: float, action: torch.Tensor | None = None,
+                     anchor: torch.Tensor | None = None) -> torch.Tensor:
     """Angular distance between the ghost's predicted anchor and the observed one.
 
     Returns a scalar tensor. Larger = the ghost was more wrong. No hidden label.
     """
-    pred = predicted_anchor(ghost, step)
+    pred = predicted_anchor(ghost, step, action=action, anchor=anchor)
     err = angular_distance(pred, observed_anchor.reshape(-1))
     return finite_or_raise("predictive_error", err)
 
@@ -64,6 +70,7 @@ def update_after_recoupling(
     step: float,
     baseline_err: torch.Tensor,
     learning_rate: float = 0.1,
+    prediction_error: torch.Tensor | None = None,
 ) -> GhostTrajectory:
     """Update role-free state from an *external* observation only.
 
@@ -76,7 +83,11 @@ def update_after_recoupling(
     positive evidence and falls with negative evidence. Internal rollout can
     never call this; grounding/evidence are manufactured only here.
     """
-    err = predictive_error(ghost, observed_anchor, step)
+    err = (
+        predictive_error(ghost, observed_anchor, step)
+        if prediction_error is None
+        else prediction_error
+    )
     advantage = baseline_err - err
     positive = torch.relu(advantage)
     negative = torch.relu(-advantage)

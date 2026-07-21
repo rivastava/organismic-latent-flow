@@ -33,6 +33,7 @@ action delta (no influence, no gradient, no RNG/training-order change).
 import torch
 
 from olf.geometry import (
+    angular_distance,
     antipodal,
     exponential_map,
     log_map_sphere,
@@ -50,6 +51,7 @@ from .diagnostics import (
 )
 from .population import GhostPopulation
 from .recoupling import ReachabilityBuffer, measure_reachability, recouple
+from .trajectory import make_ghost
 
 
 class GhostIntegration:
@@ -85,6 +87,7 @@ class GhostIntegration:
         self._merges_total = 0
         self._evictions_total = 0
         self._recouplings_total = 0
+        self._last_tension = None
 
         # Hard audit: the ghost config / population must not carry prohibited labels.
         assert_no_prohibited_labels(config)
@@ -107,6 +110,20 @@ class GhostIntegration:
             evidence = 0.0
             grounding = 0.0
             transfer_support = 0
+        branches = (
+            (
+                self.buffer.composed_schemas(
+                    self.prev_anchor, self.config.effective_capacity
+                )
+                if self.config.schema_composition_enabled
+                else self.buffer.schemas(
+                    self.prev_anchor, self.config.effective_capacity
+                )
+            )
+            if self.prev_anchor is not None
+            else []
+        )
+        composition_stats = self.buffer.composition_stats()
         return {
             "births_total": self._births_total,
             "merges_total": self._merges_total,
@@ -116,7 +133,20 @@ class GhostIntegration:
             "evidence_support_mean": evidence,
             "grounding_mean": grounding,
             "transfer_support": transfer_support,
+            "schemas": self.buffer.schema_count(),
+            "composed_branches": sum(
+                branch.get("depth", 1) > 1 for branch in branches
+            ),
+            "max_schema_depth": max(
+                (branch.get("depth", 1) for branch in branches), default=0
+            ),
+            **composition_stats,
         }
+
+    def tension(self) -> dict:
+        """Return current grounded future disagreement without changing state."""
+        with torch.no_grad():
+            return self.population.tension(self.config.transport_step)
 
     def _record_recoupling(self, report) -> None:
         self._recouplings_total += 1
@@ -136,11 +166,13 @@ class GhostIntegration:
         self.population = GhostPopulation(
             self.config.latent_dim, self.config.effective_capacity
         )
+        self.buffer.start_segment()
         self.prev_anchor = None
         self._recoupled_since_influence = True
         self._pending_token = None
         self._pending_transaction = None
         self._aborted_at_reset = aborted_pending
+        self._last_tension = None
 
     # ---- step lifecycle --------------------------------------------------
     def begin_step(self, real_anchor: torch.Tensor) -> None:
@@ -148,6 +180,34 @@ class GhostIntegration:
         h = project_to_sphere(real_anchor.detach().reshape(1, -1))[0]
         self._audit_population()
         if len(self.population) == 0:
+            if self.config.schema_composition_enabled:
+                schemas = self.buffer.composed_schemas(
+                    h, self.config.effective_capacity
+                )
+            else:
+                schemas = self.buffer.schemas(
+                    h, self.config.effective_capacity
+                )
+            if schemas:
+                restored = GhostPopulation.empty(
+                    self.config.latent_dim, self.config.effective_capacity
+                )
+                for schema in schemas:
+                    ghost = make_ghost(
+                        anchor=h,
+                        tangent=schema["tangent"],
+                        credibility=schema["strength"],
+                        grounding=schema["strength"],
+                        uncertainty=schema["uncertainty"],
+                        evidence_support=schema["support"],
+                        horizon_expr=schema["strength"],
+                    )
+                    for source, action, tangent in schema["evidence"]:
+                        ghost = ghost.add_action_evidence(
+                            source, action, tangent
+                        )
+                    restored.append(ghost)
+                self.population = restored
             self.prev_anchor = h.detach().reshape(-1)
             return
         if self.prev_anchor is None or not self.config.persistence_enabled:
@@ -199,6 +259,8 @@ class GhostIntegration:
             "population": len(self.population),
             "base_future": base_future,
         }
+        self._last_tension = self.tension()
+        diag["tension_before"] = self._last_tension
 
         if not self.config.influences_action:
             diag["influenced"] = False
@@ -217,7 +279,7 @@ class GhostIntegration:
             return zero, diag, False, base_future, None
 
         delta, diag, influenced, ghost_indices = self._influence(
-            h, sigma_flat, self_state, base_action, diag
+            h, sigma_flat, self_state, base_action, diag, sigma_t=sigma_t
         )
 
         if influenced:
@@ -233,6 +295,7 @@ class GhostIntegration:
                 "ghost_indices": ghost_indices,
                 "released_action": None,
                 "finalized": False,
+                "tension_before": self._last_tension,
             }
             return delta, diag, True, base_future, token
         return zero, diag, False, base_future, None
@@ -290,7 +353,9 @@ class GhostIntegration:
             tangent = project_to_tangent(h, predicted_effect[0])
             return exponential_map(h, tangent)
 
-    def _influence(self, h, sigma_flat, self_state, base_action, diag):
+    def _influence(
+        self, h, sigma_flat, self_state, base_action, diag, sigma_t=None
+    ):
         """Combine only ghost candidates; the ordinary OLF path is the control.
 
         Returns (delta, diag, influenced, ghost_indices) where delta is the
@@ -302,11 +367,12 @@ class GhostIntegration:
             )
 
         ghost_idx = list(range(len(self.population)))
-        weights = torch.zeros(len(ghost_idx))
+        weights = h.new_zeros(len(ghost_idx))
         credibility_mass = 0.0
         combined_action = torch.zeros_like(base_action[0])
         reachable_flags = []
         ghost_indices = []
+        valid_candidates = []
         step = self.config.transport_step
 
         for local_i, g_index in enumerate(ghost_idx):
@@ -337,14 +403,22 @@ class GhostIntegration:
                     dim=-1,
                 )
                 cand_action0 = self.organism.flc.motor_projection(proj_in.unsqueeze(0))[0]
-                motor_valid = bool((cand_action0.abs() <= 1.0 + 1e-3).all())
 
-                # Action-conditioned prediction: refine the target using
-                # the evidence-learned transfer map queried with the candidate
-                # action. Before enough evidence the map returns zero and the
-                # ghost stays observational.
-                if len(g.transfer_actions) >= self.config.min_action_evidence:
-                    pred_tan = g.transfer_predict(cand_action0, h)
+                action_conditioned = (
+                    len(g.transfer_actions) >= self.config.min_action_evidence
+                    and g.transfer_identifiable(self.config.min_action_evidence)
+                )
+                # Once grounded evidence defines an action-deformation map,
+                # invert that map directly for the ghost's desired tangent.
+                # Before then the candidate remains diagnostic and cannot act.
+                if action_conditioned:
+                    desired_tangent = parallel_transport_sphere(
+                        g.anchor, h, g.tangent
+                    )
+                    cand_action = torch.clamp(
+                        g.transfer_inverse(desired_tangent, h), -1.0, 1.0
+                    )
+                    pred_tan = g.transfer_predict(cand_action, h)
                     target2 = exponential_map(h, pred_tan * step)
                     if bool(antipodal(h, target2).any()):
                         reachable_flags.append(False)
@@ -359,17 +433,9 @@ class GhostIntegration:
                             "undefined_reason": "antipodal_action_target",
                         })
                         continue
-                    correction2 = self.organism.flc.transfer.inverse_correction(
-                        h.unsqueeze(0), target2.unsqueeze(0)
-                    )[0]
-                    correction2 = project_to_tangent(h, correction2)
-                    proj_in2 = torch.cat(
-                        [h, target2, correction2, sigma_flat[0], self_state[0], base_action[0]],
-                        dim=-1,
-                    )
-                    cand_action = self.organism.flc.motor_projection(proj_in2.unsqueeze(0))[0]
                 else:
                     cand_action = cand_action0
+                motor_valid = bool((cand_action.abs() <= 1.0 + 1e-3).all())
 
             # Reachability remains observational; it does not suppress a ghost.
             res = None
@@ -382,26 +448,36 @@ class GhostIntegration:
                 )
 
             reachable_flags.append(reachable)
-            diag.setdefault("candidates", []).append({
+            candidate_diag = {
                 "ghost_index": g_index,
-                "action_conditioned": len(g.transfer_actions) >= self.config.min_action_evidence,
+                "action_conditioned": action_conditioned,
                 "action_support_known": res is not None,
                 "reachable": reachable,
                 "reachability_residual": res,
                 "motor_valid": motor_valid,
                 "inverse_defined": True,
-            })
+            }
+            diag.setdefault("candidates", []).append(candidate_diag)
 
             if self.config.random_routing:
                 w = float(torch.rand((), generator=self._rng)) + 1e-8
             else:
                 credibility = max(float(g.credibility), 0.0)
                 grounding = max(float(g.grounding), 0.0)
-                credibility_mass += credibility
-                w = credibility * grounding
+                if action_conditioned:
+                    credibility_mass += credibility
+                w = credibility * grounding if action_conditioned else 0.0
             weights[local_i] = w
             combined_action = combined_action + w * cand_action
             ghost_indices.append(g_index)
+            valid_candidates.append(
+                {
+                    "ghost_index": g_index,
+                    "local_index": local_i,
+                    "action": cand_action,
+                    "diag": candidate_diag,
+                }
+            )
 
         total = float(weights.sum())
         diag["reachable_count"] = int(sum(reachable_flags))
@@ -424,13 +500,221 @@ class GhostIntegration:
             if self.config.random_routing
             else min(1.0, total / max(credibility_mass, 1e-8))
         )
+        synthesis = None
+        if not self.config.random_routing and sigma_t is not None:
+            with torch.no_grad():
+                synthesis = self._synthesize(
+                    h=h,
+                    sigma_flat=sigma_flat,
+                    self_state=self_state,
+                    sigma_t=sigma_t,
+                    base_action=base_action[0],
+                    support_amplitude=support_amplitude,
+                    weights=weights,
+                    candidates=valid_candidates,
+                )
+        if synthesis is not None:
+            diag.update(synthesis["diag"])
+            if synthesis["selected_ordinary"]:
+                diag["influenced"] = False
+                return (
+                    torch.zeros_like(base_action[0]),
+                    diag,
+                    False,
+                    ghost_indices,
+                )
+            combined_action = synthesis["action"]
         # Delta relative to the ordinary OLF candidate (the unmodified path).
         delta = (
-            support_amplitude * (combined_action - base_action[0])
+            combined_action - base_action[0]
+            if synthesis is not None
+            else support_amplitude * (combined_action - base_action[0])
         ).reshape(1, -1)
         diag["influenced"] = True
         diag["support_amplitude"] = float(support_amplitude)
         return delta, diag, True, ghost_indices
+
+    def _synthesize(
+        self,
+        *,
+        h,
+        sigma_flat,
+        self_state,
+        sigma_t,
+        base_action,
+        support_amplitude,
+        weights,
+        candidates,
+    ):
+        """Cross-evaluate actions under every grounded transformation model.
+
+        No scalar synthesis reward is introduced. Candidate futures are compared
+        on three non-dominated quantities: model disagreement, mismatch to OLF's
+        current future latent, and existing boundary-attributable danger.
+        """
+        model_indices = [
+            index
+            for index, ghost in enumerate(self.population._ghosts)
+            if float(weights[index]) > 0.0
+            and ghost.transfer_identifiable(self.config.min_action_evidence)
+        ]
+        supported_candidates = [
+            candidate
+            for candidate in candidates
+            if float(weights[candidate["local_index"]]) > 0.0
+        ]
+        if len(model_indices) < 2 or len(supported_candidates) < 2:
+            return None
+
+        model_weights = weights[model_indices]
+        model_weights = model_weights / model_weights.sum()
+        desired_future = self.organism.flc.future_field(
+            h.unsqueeze(0), sigma_flat, self_state
+        ).latent[0]
+
+        zero_action = torch.zeros_like(base_action).unsqueeze(0)
+        zero_effect = self._predicted_effect(sigma_t, zero_action)
+        zero_risk = self.organism.veto.predict_risk(
+            h.unsqueeze(0), zero_action, zero_effect.unsqueeze(0)
+        )[0, 0]
+
+        action_rows = [
+            {
+                "action": base_action,
+                "source": None,
+                "support": 0.0,
+                "diag": None,
+            }
+        ]
+        action_rows.extend(
+            {
+                "action": torch.clamp(
+                    base_action
+                    + support_amplitude * (candidate["action"] - base_action),
+                    -1.0,
+                    1.0,
+                ),
+                "source": candidate["ghost_index"],
+                "support": float(weights[candidate["local_index"]]),
+                "diag": candidate["diag"],
+            }
+            for candidate in supported_candidates
+        )
+
+        objectives = []
+        valid_rows = []
+        for row in action_rows:
+            action = row["action"]
+            predicted_futures = []
+            for model_index in model_indices:
+                ghost = self.population._ghosts[model_index]
+                predicted = ghost.transfer_predict(action, h)
+                predicted_futures.append(
+                    exponential_map(h, predicted * self.config.transport_step)
+                )
+            futures = torch.stack(predicted_futures)
+            pairwise = angular_distance(
+                futures[:, None, :], futures[None, :, :]
+            )
+            pair_weights = model_weights[:, None] * model_weights[None, :]
+            disagreement = 0.5 * torch.sum(
+                pair_weights * pairwise.square()
+            )
+            resultant = torch.sum(model_weights[:, None] * futures, dim=0)
+            if float(resultant.norm()) <= torch.finfo(resultant.dtype).eps:
+                continue
+            consensus = project_to_sphere(resultant)
+            future_mismatch = angular_distance(consensus, desired_future)
+
+            predicted_effect = self._predicted_effect(
+                sigma_t, action.unsqueeze(0)
+            )
+            risk = self.organism.veto.predict_risk(
+                h.unsqueeze(0),
+                action.unsqueeze(0),
+                predicted_effect.unsqueeze(0),
+            )[0, 0]
+            danger = torch.relu(risk - zero_risk)
+            metric = (
+                float(danger),
+                float(disagreement),
+                float(future_mismatch),
+            )
+            objectives.append(metric)
+            valid_rows.append(row)
+            if row["diag"] is not None:
+                row["diag"].update(
+                    {
+                        "synthesis_danger": metric[0],
+                        "synthesis_disagreement": metric[1],
+                        "synthesis_future_mismatch": metric[2],
+                    }
+                )
+
+        if len(valid_rows) < 2:
+            return None
+        front = _non_dominated_indices(objectives)
+        ordinary_index = next(
+            (
+                index
+                for index, row in enumerate(valid_rows)
+                if row["source"] is None
+            ),
+            None,
+        )
+        if ordinary_index is None:
+            return None
+        ordinary_objective = objectives[ordinary_index]
+        dominating_ghosts = [
+            index
+            for index, row in enumerate(valid_rows)
+            if row["source"] is not None
+            and all(
+                left <= right
+                for left, right in zip(
+                    objectives[index], ordinary_objective, strict=True
+                )
+            )
+            and any(
+                left < right
+                for left, right in zip(
+                    objectives[index], ordinary_objective, strict=True
+                )
+            )
+        ]
+        selected = (
+            max(
+                dominating_ghosts,
+                key=lambda index: (valid_rows[index]["support"], -index),
+            )
+            if dominating_ghosts
+            else ordinary_index
+        )
+        selected_row = valid_rows[selected]
+        selected_source = selected_row["source"]
+        return {
+            "action": torch.clamp(selected_row["action"], -1.0, 1.0),
+            "selected_ordinary": selected_source is None,
+            "diag": {
+                "routing": "pareto_synthesis",
+                "synthesis_model_count": len(model_indices),
+                "synthesis_candidate_count": len(valid_rows),
+                "synthesis_pareto_indices": front,
+                "synthesis_dominating_ghosts": dominating_ghosts,
+                "synthesis_selected_ghost": selected_source,
+                "synthesis_objectives": objectives,
+            },
+        }
+
+    def _predicted_effect(self, sigma_t, action):
+        consequences = self.organism.semantics.predict_consequences(
+            sigma_t.detach(), action.detach()
+        )
+        affordance = self.organism._compute_entity_affordance(consequences)
+        entity_weights = torch.softmax(affordance, dim=-1)
+        return (
+            entity_weights.unsqueeze(-1) * consequences["dh_pred"]
+        ).sum(dim=1)[0]
 
     def _centroid_before_inverse(
         self,
@@ -447,7 +731,7 @@ class GhostIntegration:
         step = self.config.transport_step
         with torch.no_grad():
             for index, ghost in enumerate(self.population._ghosts):
-                if len(ghost.transfer_actions) >= self.config.min_action_evidence:
+                if ghost.transfer_identifiable(self.config.min_action_evidence):
                     predicted = ghost.transfer_predict(base_action[0], h)
                     future = exponential_map(h, predicted * step)
                 else:
@@ -573,6 +857,7 @@ class GhostIntegration:
             frozen_prev = transaction["real_prev"]
             frozen_base = transaction["base_future_anchor"]
             frozen_action = transaction["released_action"]
+            tension_before = transaction["tension_before"]
             pop_after, self.buffer, report = recouple(
                 self.population, frozen_prev, observed_anchor,
                 frozen_base, self.config, self.buffer,
@@ -587,16 +872,7 @@ class GhostIntegration:
             )[0].detach().reshape(-1)
             self._pending_transaction = None
             self._record_recoupling(report)
-            return {
-                "updated": True,
-                "population": len(self.population),
-                "born": report.born,
-                "merged": report.merged,
-                "evicted": report.evicted_count,
-                "reachability_prototypes": report.reachability_prototypes,
-                "per_ghost_error": report.per_ghost_error,
-                "lifecycle_reasons": report.lifecycle_reasons,
-            }
+            return self._recoupling_result(report, tension_before)
 
         # No token: observe mode or a non-influenced step.
         if not self.config.recoupling_enabled:
@@ -616,6 +892,20 @@ class GhostIntegration:
             observed_anchor.detach().reshape(1, -1)
         )[0].detach().reshape(-1)
         self._record_recoupling(report)
+        return self._recoupling_result(report, self._last_tension)
+
+    def _recoupling_result(self, report, tension_before):
+        tension_after = self.tension()
+        tension_reduction = None
+        if (
+            tension_before is not None
+            and tension_before.get("defined", False)
+            and tension_after.get("defined", False)
+        ):
+            tension_reduction = max(
+                0.0,
+                tension_before["normalized"] - tension_after["normalized"],
+            )
         return {
             "updated": True,
             "population": len(self.population),
@@ -625,6 +915,12 @@ class GhostIntegration:
             "reachability_prototypes": report.reachability_prototypes,
             "per_ghost_error": report.per_ghost_error,
             "lifecycle_reasons": report.lifecycle_reasons,
+            "predictive_advantage": report.predictive_advantage,
+            "schema_consolidated": report.schema_consolidated,
+            "schema_count": report.schema_count,
+            "tension_before": tension_before,
+            "tension_after": tension_after,
+            "tension_reduction": tension_reduction,
         }
 
     # ---- finite / invariant guards --------------------------------------
@@ -655,3 +951,23 @@ def motor_valid_count(diag):
     if not cands:
         return 1.0
     return sum(1 for c in cands if c.get("motor_valid", True)) / len(cands)
+
+
+def _non_dominated_indices(objectives):
+    """Return indices not strictly dominated on all minimized objectives."""
+    front = []
+    for index, current in enumerate(objectives):
+        dominated = False
+        for other_index, other in enumerate(objectives):
+            if index == other_index:
+                continue
+            no_worse = all(left <= right for left, right in zip(other, current, strict=True))
+            strictly_better = any(
+                left < right for left, right in zip(other, current, strict=True)
+            )
+            if no_worse and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(index)
+    return front

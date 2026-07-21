@@ -936,7 +936,18 @@ class Organism(nn.Module):
         consequences = self.semantics.predict_consequences(sigma_t, a_cand_init)
 
         # 4. Impasse and context assessment
-        impasse_detected = self.impasse_detector.detect()
+        physical_impasse = self.impasse_detector.detect()
+        ghost_tension = None
+        dialectical_pressure = 0.0
+        if (
+            self.ghost is not None
+            and self.ghost.config.influences_action
+        ):
+            ghost_tension = self.ghost.tension()
+            if ghost_tension["defined"]:
+                dialectical_pressure = float(ghost_tension["normalized"])
+        impasse_pressure = max(float(physical_impasse), dialectical_pressure)
+        impasse_detected = impasse_pressure > 0.0
         grounding_confidence = self._consequence_grounding_confidence()
         predicted_uncertainty = consequences["uncertainty"].mean().item()
         uncertainty = (
@@ -977,6 +988,8 @@ class Organism(nn.Module):
             self.diag_buffer.append({
                 "step": int(self.diag_episode),
                 "impasse": bool(impasse_detected),
+                "physical_impasse": bool(physical_impasse),
+                "dialectical_pressure": dialectical_pressure,
                 "uncertainty": float(uncertainty),
                 "pred_risk": float(risk),
                 "consequence_grounding_confidence": grounding_confidence,
@@ -1014,7 +1027,7 @@ class Organism(nn.Module):
 
         # 6. Mode arbitration
         mode, mode_probs = self.arbitrator(
-            self.h, uncertainty, impasse_detected, risk, closure_pressure,
+            self.h, uncertainty, impasse_pressure, risk, closure_pressure,
             self.recent_consequence_val,
             diagnostic_decay=diag_decay,
             readiness=readiness,
@@ -1188,6 +1201,8 @@ class Organism(nn.Module):
             "mode_probs": mode_probs.squeeze(0).cpu().detach().numpy(),
             "consequences": consequences_final,
             "impasse": impasse_detected,
+            "impasse_pressure": impasse_pressure,
+            "ghost_tension": ghost_tension,
             "risk": risk,
             "need_pressure": need_pressure,
             "danger": danger,

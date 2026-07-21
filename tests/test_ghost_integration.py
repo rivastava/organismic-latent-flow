@@ -524,7 +524,7 @@ def test_only_ungrounded_ghosts_produce_zero_influence():
     assert all(weight == 0.0 for weight in info["ghost"].get("weights", []))
 
 
-def test_grounding_sets_continuous_influence_amplitude():
+def test_grounding_without_action_evidence_remains_observational():
     org = _org("influence", ablation="no_reachability")
     anchor = project_to_sphere(torch.randn(16))
     tangent = 0.1 * project_to_tangent(anchor, torch.randn(16))
@@ -538,8 +538,8 @@ def test_grounding_sets_continuous_influence_amplitude():
         )
     )
     _, info = org.select_action(torch.randn(18).numpy(), evaluate=True)
-    assert (info["ghost"] or {}).get("ghost_influenced")
-    assert info["ghost"]["support_amplitude"] == pytest.approx(0.25)
+    assert not (info["ghost"] or {}).get("ghost_influenced")
+    assert info["ghost"]["no_candidates"]
 
 
 # ---- transactional token ownership --------------------------------
@@ -719,7 +719,7 @@ def test_boundary_eval_after_warmup_no_exception():
 
 
 # ---- action-conditioned evidence binds action to consequence ------
-def test_signature_path_operates_before_action_conditioned_evidence():
+def test_signature_path_waits_for_action_conditioned_evidence():
     org = _org("influence", ablation="no_reachability")
     anchor = project_to_sphere(torch.randn(16))
     tangent = 0.1 * project_to_tangent(anchor, torch.randn(16))
@@ -730,7 +730,7 @@ def test_signature_path_operates_before_action_conditioned_evidence():
     org.ghost.population.append(g)
     obs = torch.randn(18).numpy()
     a, info = org.select_action(obs, evaluate=True)
-    assert (info["ghost"] or {}).get("ghost_influenced")
+    assert not (info["ghost"] or {}).get("ghost_influenced")
     assert info["ghost"]["candidates"][0]["action_conditioned"] is False
 
 

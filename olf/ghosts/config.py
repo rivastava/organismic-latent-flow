@@ -41,6 +41,7 @@ ABLATIONS = (
     "no_recoupling",
     "no_reachability",
     "random_routing",
+    "no_schema_composition",
 )
 
 
@@ -126,3 +127,13 @@ class GhostConfig:
     @property
     def random_routing(self) -> bool:
         return self.ablation == "random_routing"
+
+    @property
+    def schema_composition_enabled(self) -> bool:
+        """False only when the ``no_schema_composition`` ablation is active.
+
+        Depth-one schema reuse (single-step ``schemas(...)``) remains active in
+        every condition; only recursive composition across schema adjacencies
+        (``composed_schemas(...)``) is disabled.
+        """
+        return self.ablation != "no_schema_composition"

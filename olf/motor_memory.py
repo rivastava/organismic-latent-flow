@@ -147,6 +147,23 @@ class MotorMemory(nn.Module):
             return actions[idx], deltas[idx], vals
         return actions[idx], vals
 
+    def query_nearby_actions(self, h_query, k=3):
+        """Return nearby observed actions without reward or outcome ranking."""
+        active = self.trace_active > 0.5
+        if not bool(active.any()):
+            return None
+        before = self.trace_before[active]
+        actions = self.trace_actions[active]
+        h = h_query.detach().reshape(1, -1).to(before)
+        if h.shape[-1] != self.latent_dim:
+            padded = torch.zeros(1, self.latent_dim, device=before.device)
+            width = min(self.latent_dim, h.shape[-1])
+            padded[..., :width] = h[..., :width]
+            h = padded
+        similarities = torch.nn.functional.cosine_similarity(before, h, dim=-1)
+        indices = torch.topk(similarities, k=min(k, len(similarities))).indices
+        return actions[indices]
+
     def size(self) -> int:
         return int(self.trace_active.sum().item())
 
@@ -164,6 +181,9 @@ class _EmptyMotorMemory(nn.Module):
         return None
 
     def query_similar_action(self, *args, **kwargs):
+        return None
+
+    def query_nearby_actions(self, *args, **kwargs):
         return None
 
     def size(self) -> int:

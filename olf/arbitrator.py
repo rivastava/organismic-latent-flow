@@ -52,7 +52,8 @@ class ModeArbitrator(nn.Module):
         
         # Convert scalar inputs to tensors
         u_t = torch.tensor([[uncertainty]], device=device)
-        i_t = torch.tensor([[float(impasse)]], device=device)
+        impasse_pressure = float(np.clip(float(impasse), 0.0, 1.0))
+        i_t = torch.tensor([[impasse_pressure]], device=device)
         r_t = torch.tensor([[risk]], device=device)
         c_t = torch.FloatTensor(closure_pressure).unsqueeze(0).to(device)
         rc_t = torch.tensor([[recent_consequence]], device=device)
@@ -87,8 +88,10 @@ class ModeArbitrator(nn.Module):
         if risk > 0.8:
             bias[0, 3] += 2.0   # Nudge toward Avoid
         
-        if impasse:
-            bias[0, 2] += 2.0   # Nudge toward Invent
+        if impasse_pressure > 0.0:
+            # Physical blockage contributes 1.0. Grounded ghost disagreement
+            # contributes continuously through the same organismic regime.
+            bias[0, 2] += 2.0 * impasse_pressure
         
         # Closure pressure increases Exploit/Release bias
         closure_magnitude = np.linalg.norm(closure_pressure)

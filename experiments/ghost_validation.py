@@ -41,6 +41,7 @@ CONDITIONS = (
     "no_persistence",
     "no_recoupling",
     "random_routing",
+    "no_schema_composition",
 )
 ABLATION_CONDITIONS = CONDITIONS[3:]
 OBS_DIM = 18
@@ -70,6 +71,9 @@ class EpisodeRecord:
     boundary_verdict_counts: dict[str, int]
     rollback_rate: float
     ghost_influence_rate: float
+    synthesis_rate: float
+    tension_defined_rate: float
+    tension_mean: float | None
     population_mean: float
     evidence_support_mean: float
     grounding_mean: float
@@ -79,6 +83,11 @@ class EpisodeRecord:
     merges: int
     evictions: int
     recouplings: int
+    schemas: int
+    composed_branches: int
+    max_schema_depth: int
+    composition_candidates: int
+    composition_eligible: int
 
 
 def _condition_spec(condition: str) -> tuple[str, str | None]:
@@ -204,6 +213,8 @@ def _evaluate(
         influenced = 0
         populations = []
         residuals = []
+        tensions = []
+        synthesis_steps = 0
 
         while not done:
             # Boundary steering differentiates risk with respect to the candidate
@@ -231,6 +242,10 @@ def _evaluate(
 
             ghost_info = action_info.get("ghost") or {}
             influenced += int(bool(ghost_info.get("ghost_influenced", False)))
+            synthesis_steps += int(ghost_info.get("routing") == "pareto_synthesis")
+            tension = action_info.get("ghost_tension")
+            if tension is not None and tension.get("defined", False):
+                tensions.append(float(tension["normalized"]))
             populations.append(int(ghost_info.get("population", 0)))
             for candidate in ghost_info.get("candidates", []):
                 residual = candidate.get("reachability_residual")
@@ -268,7 +283,9 @@ def _evaluate(
         after = agent.ghost.telemetry() if agent.ghost is not None else None
         if after is None:
             evidence = grounding = 0.0
-            transfer_support = births = merges = evictions = recouplings = 0
+            transfer_support = births = merges = evictions = recouplings = schemas = 0
+            composed_branches = max_schema_depth = 0
+            composition_candidates = composition_eligible = 0
         else:
             evidence = float(after["evidence_support_mean"])
             grounding = float(after["grounding_mean"])
@@ -277,6 +294,11 @@ def _evaluate(
             merges = _telemetry_delta(before, after, "merges_total")
             evictions = _telemetry_delta(before, after, "evictions_total")
             recouplings = _telemetry_delta(before, after, "recouplings_total")
+            schemas = int(after["schemas"])
+            composed_branches = int(after["composed_branches"])
+            max_schema_depth = int(after["max_schema_depth"])
+            composition_candidates = int(after["composition_candidates"])
+            composition_eligible = int(after["composition_eligible"])
 
         records.append(
             EpisodeRecord(
@@ -297,6 +319,9 @@ def _evaluate(
                 boundary_verdict_counts=verdict_counts,
                 rollback_rate=rollbacks / max(step, 1),
                 ghost_influence_rate=influenced / max(step, 1),
+                synthesis_rate=synthesis_steps / max(step, 1),
+                tension_defined_rate=len(tensions) / max(step, 1),
+                tension_mean=float(np.mean(tensions)) if tensions else None,
                 population_mean=float(np.mean(populations)),
                 evidence_support_mean=evidence,
                 grounding_mean=grounding,
@@ -308,6 +333,11 @@ def _evaluate(
                 merges=merges,
                 evictions=evictions,
                 recouplings=recouplings,
+                schemas=schemas,
+                composed_branches=composed_branches,
+                max_schema_depth=max_schema_depth,
+                composition_candidates=composition_candidates,
+                composition_eligible=composition_eligible,
             )
         )
     return records, traces

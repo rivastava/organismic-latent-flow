@@ -1,120 +1,99 @@
 import torch
 import torch.nn as nn
 
+
 class InventionGenerator(nn.Module):
-    """
-    InventionGenerator generates novel actions (u) under impasse.
-    It performs hallucinated rollouts by querying the ConsequenceMemory trace buffer
-    to validate candidate action effects, preventing compulsive novelty.
-    """
+    """Generate abstract alternatives when the organism reaches an impasse."""
+
     def __init__(self, latent_dim=32, action_dim=3, hidden_dim=64):
         super().__init__()
         self.latent_dim = latent_dim
         self.action_dim = action_dim
-        
-        # Generation network: creates base action candidates
-        # Input: [h_t, situated_embeddings_mean]
         self.proposal_net = nn.Sequential(
             nn.Linear(latent_dim + hidden_dim, 32),
             nn.ReLU(),
             nn.Linear(32, action_dim),
-            nn.Tanh()
+            nn.Tanh(),
         )
-        
-    def forward(self, h, situated_embeds, consequence_memory, motor_memory=None, num_candidates=5):
-        """Generates and validates invention actions using consequence memory rollouts.
 
-        motor_memory seeds candidates from previously-observed
-        successful transformations.
+    def forward(
+        self,
+        h,
+        situated_embeds,
+        consequence_memory,
+        motor_memory=None,
+        num_candidates=5,
+    ):
+        """Generate alternatives and select a non-dominated viable action.
 
-        delta scoring. Retrieved delta_h is used to BONUS candidates
-        whose action-space direction/magnitude aligns with successful past
-        transformations. No latent→action dimension mixing — deltas are used
-        only for scoring, not for direct candidate modification.
+        Candidate birth is symmetric around the current proposal and may reuse
+        actions observed in nearby latent states. Selection uses predicted
+        lethal risk, body-state deformation, and retrieval uncertainty. It does
+        not read stored reward, success, task identity, or privileged state.
         """
-        # Mean situated embedding to represent task state
         avg_embed = situated_embeds.mean(dim=1)
-
-        # Generate base action proposal
         inputs = torch.cat([h, avg_embed], dim=-1)
         base_proposal = self.proposal_net(inputs)
+        if not bool((consequence_memory.trace_active > 0.5).any()):
+            return base_proposal
 
-        # If consequence memory is empty, return base proposal with some explore noise
-        if consequence_memory.trace_active.sum() == 0:
-            noise = torch.randn_like(base_proposal) * 0.1
-            return torch.clamp(base_proposal + noise, -1.0, 1.0)
-
-        candidates = []
-
-        # seed candidates from motor_memory if available and non-empty.
-        delta_info = None  # store delta statistics for scoring
+        candidates = [base_proposal, -base_proposal]
         if motor_memory is not None and motor_memory.size() > 0:
-            mm_result = motor_memory.query_similar_action(h, k=3, return_delta=True)
-            if mm_result is not None:
-                mm_actions, mm_deltas, mm_scores = mm_result
-                if mm_actions is not None and len(mm_actions) > 0:
-                    # Bias base proposal toward top motor memory action.
-                    top_action = mm_actions[0]
-                    base_proposal = 0.5 * base_proposal + 0.5 * top_action.reshape_as(base_proposal)
-                    # Add motor-memory-seeded candidates.
-                    for i in range(min(2, len(mm_actions))):
-                        noise = torch.randn_like(base_proposal) * 0.15
-                        cand = torch.clamp(mm_actions[i].reshape_as(base_proposal) + noise, -1.0, 1.0)
-                        candidates.append(cand)
-                    # extract delta statistics for scoring bonus.
-                    # Use the mean delta direction and magnitude as the
-                    # "successful transformation signature."
-                    successful_deltas = mm_deltas[mm_scores > 0]  # only positive-scored
-                    if len(successful_deltas) > 0:
-                        delta_mean = successful_deltas.mean(dim=0)  # (latent_dim,)
-                        delta_norm = float(delta_mean.norm().item())
-                        delta_info = {"mean": delta_mean, "norm": delta_norm}
+            observed = motor_memory.query_nearby_actions(
+                h, k=max(1, num_candidates // 2)
+            )
+            if observed is not None:
+                for action in observed:
+                    action = action.reshape_as(base_proposal)
+                    candidates.extend((action, -action))
+        candidates = candidates[:max(1, num_candidates)]
 
-        # Create a set of candidate action mutations from the (possibly
-        # motor-memory-seeded) base proposal.
-        for _i in range(num_candidates):
-            noise = torch.randn_like(base_proposal) * 0.25
-            cand = torch.clamp(base_proposal + noise, -1.0, 1.0)
-            candidates.append(cand)
+        objectives = []
+        confidences = []
+        for candidate in candidates:
+            _, predicted, confidence = consequence_memory.retrieve_trace(
+                avg_embed, candidate
+            )
+            objectives.append(
+                (
+                    float(predicted[0, 1].clamp_min(0.0)),
+                    float(predicted[0, 2]),
+                    float(predicted[0, 3]),
+                    1.0 - float(confidence),
+                )
+            )
+            confidences.append(float(confidence))
 
-        best_cand = base_proposal
-        best_score = -999.0
+        front = _non_dominated_indices(objectives)
+        selected = max(
+            front,
+            key=lambda index: (
+                confidences[index],
+                -float(torch.norm(candidates[index] - base_proposal).detach()),
+                -index,
+            ),
+        )
+        return torch.clamp(candidates[selected], -1.0, 1.0)
 
-        # Validate candidates through consequence memory lookup (hallucination)
-        for cand in candidates:
-            pred_h, pred_cons, confidence = consequence_memory.retrieve_trace(avg_embed, cand)
 
-            # Consequence vec: [reward, danger_risk, hunger_delta, fatigue_delta]
-            pred_reward = pred_cons[0, 0].item()
-            pred_danger = pred_cons[0, 1].item()
-
-            # Score: reward minus danger risk, scaled by similarity confidence
-            score = (pred_reward - 1.5 * pred_danger) * (1.0 + confidence)
-
-            # delta scoring bonus. Use tangent-space delta direction
-            # to score candidates by their predicted transformation alignment.
-            # The retrieved delta predicts what transformation the stored action
-            # produced. Candidates that would produce similar transformations
-            # (in latent space) get higher scores.
-            if delta_info is not None and delta_info["norm"] > 1e-4:
-                delta_mean = delta_info["mean"]  # tangent-space velocity (latent_dim,)
-                # Score alignment: how well does this candidate's implied
-                # transformation align with successful past transformations?
-                # Cosine similarity between the delta direction
-                # and the candidate's action-space direction (projected through
-                # a simple heuristic: action norm correlates with latent delta norm).
-                cand_norm = float(cand.norm().item())
-                delta_norm = delta_info["norm"]
-                # Norm ratio: candidates with similar magnitude to successful
-                # transformations get a bonus
-                norm_ratio = min(cand_norm, delta_norm) / (max(cand_norm, delta_norm) + 1e-8)
-                # Direction alignment: use the delta's angular consistency
-                # (higher norm → more decisive transformation → stronger signal)
-                alignment_bonus = 1.0 + 0.3 * norm_ratio * min(1.0, delta_norm / (delta_norm + 0.1))
-                score = score * alignment_bonus
-
-            if score > best_score:
-                best_score = score
-                best_cand = cand
-
-        return best_cand
+def _non_dominated_indices(objectives):
+    front = []
+    for index, current in enumerate(objectives):
+        dominated = False
+        for other_index, other in enumerate(objectives):
+            if index == other_index:
+                continue
+            no_worse = all(
+                left <= right
+                for left, right in zip(other, current, strict=True)
+            )
+            strictly_better = any(
+                left < right
+                for left, right in zip(other, current, strict=True)
+            )
+            if no_worse and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(index)
+    return front

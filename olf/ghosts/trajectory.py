@@ -19,8 +19,8 @@ No semantic label, task, identity, world, relation, or reward field exists.
 
 Action-conditioned evidence:
   Each ghost records the externally observed (released_action, observed_tangent)
-  pairs. A locally fitted, ridge-regularized linear transfer map learns
-      observed_tangent ~ M @ released_action
+  pairs. A locally fitted, ridge-regularized affine transfer map learns
+      observed_tangent ~ drift + M @ released_action
   in the tangent space at the current anchor. This is bounded, role-free,
   externally grounded, deterministic, and explicitly experimental scaffolding:
   before enough (action, tangent) evidence exists the ghost cannot form an
@@ -142,20 +142,69 @@ class GhostTrajectory:
 
     def transfer_predict(self, action: torch.Tensor,
                          anchor: torch.Tensor | None = None) -> torch.Tensor:
-        """Action-conditioned deformation via a ridge-regularized linear map.
+        """Action-conditioned deformation via a ridge-regularized affine map.
 
         Returns a tangent at ``anchor``. With fewer than two stored pairs the
         map is undefined and returns the zero tangent. Integration uses the
         observed signature continuation until this refinement is available.
         """
-        if len(self.transfer_tangents) < 2:
+        if not self.transfer_identifiable():
             a0 = self.anchor if anchor is None else anchor
             return torch.zeros_like(project_to_sphere(a0.detach().reshape(-1)))
+        query_anchor, matrix, drift = self._transfer_model(anchor)
+        action_v = action.detach().reshape(-1).to(
+            device=matrix.device, dtype=matrix.dtype
+        )
+        pred = drift + matrix @ action_v
+        return project_to_tangent(query_anchor, pred)
+
+    def transfer_identifiable(self, min_observations: int = 2) -> bool:
+        """Whether external observations contain action variation."""
+        if len(self.transfer_actions) < min_observations:
+            return False
+        actions = torch.stack(
+            [action.detach().reshape(-1) for action in self.transfer_actions]
+        ).double()
+        centered = actions - actions.mean(dim=0, keepdim=True)
+        return int(torch.linalg.matrix_rank(centered)) > 0
+
+    def transfer_inverse(
+        self,
+        target_tangent: torch.Tensor,
+        anchor: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Infer the minimum-energy action for a grounded deformation."""
+        if not self.transfer_identifiable():
+            raise RuntimeError("inverse transfer requires varied external actions")
+        query_anchor, matrix, drift = self._transfer_model(anchor)
+        target = project_to_tangent(
+            query_anchor,
+            target_tangent.detach().reshape(-1).to(matrix),
+        )
+        output_dtype = matrix.dtype
+        matrix = matrix.double()
+        target = target.double()
+        gram = matrix.t() @ matrix
+        scale = gram.trace().clamp_min(torch.finfo(matrix.dtype).eps)
+        ridge = torch.finfo(matrix.dtype).eps ** 0.5 * scale / matrix.shape[1]
+        action = torch.linalg.solve(
+            gram + ridge * torch.eye(
+                gram.shape[0], device=gram.device, dtype=gram.dtype
+            ),
+            matrix.t() @ (target - drift.double()),
+        )
+        return action.to(output_dtype)
+
+    def _transfer_model(
+        self, anchor: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query_anchor = project_to_sphere(
             (self.anchor if anchor is None else anchor).detach().reshape(-1)
         )
-        A = torch.stack([a.detach().reshape(-1) for a in self.transfer_actions])
-        T = torch.stack(
+        actions = torch.stack(
+            [action.detach().reshape(-1) for action in self.transfer_actions]
+        )
+        tangents = torch.stack(
             [
                 parallel_transport_sphere(
                     source.detach().reshape(-1),
@@ -169,25 +218,30 @@ class GhostTrajectory:
                 )
             ]
         )
-        # Ridge regression: M = T^T A (A^T A + lam I)^{-1}   (D, A)
+        # Centered ridge regression separates persistent drift from action effect.
         # Scale-derived numerical ridge. Trace(A^T A) is invariant to action-axis
         # permutations, so stabilization introduces no preferred action axis.
-        output_dtype = A.dtype
-        A = A.double()
-        T = T.double()
-        gram = A.t() @ A
+        output_dtype = actions.dtype
+        actions = actions.double()
+        tangents = tangents.double()
+        action_mean = actions.mean(dim=0)
+        tangent_mean = tangents.mean(dim=0)
+        centered_actions = actions - action_mean
+        centered_tangents = tangents - tangent_mean
+        gram = centered_actions.t() @ centered_actions
         lam = (
-            torch.finfo(A.dtype).eps ** 0.5
-            * gram.trace().clamp_min(torch.finfo(A.dtype).eps)
-            / A.shape[1]
+            torch.finfo(actions.dtype).eps ** 0.5
+            * gram.trace().clamp_min(torch.finfo(actions.dtype).eps)
+            / actions.shape[1]
         )
         ATA = gram + lam * torch.eye(
-            A.shape[1], device=A.device, dtype=A.dtype
+            actions.shape[1], device=actions.device, dtype=actions.dtype
         )
-        M = torch.linalg.solve(ATA, A.t() @ T).t()  # (D, A)
-        action_v = action.detach().reshape(-1).to(device=A.device, dtype=A.dtype)
-        pred = (M @ action_v).to(output_dtype)
-        return project_to_tangent(query_anchor, pred)
+        matrix = torch.linalg.solve(
+            ATA, centered_actions.t() @ centered_tangents
+        ).t()
+        drift = tangent_mean - matrix @ action_mean
+        return query_anchor, matrix.to(output_dtype), drift.to(output_dtype)
 
     def add_action_evidence(self, source_anchor: torch.Tensor, action: torch.Tensor,
                             tangent: torch.Tensor) -> "GhostTrajectory":

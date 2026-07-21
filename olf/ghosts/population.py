@@ -9,6 +9,8 @@ must come from external evidence, never from an invented coordinate direction.
 
 import torch
 
+from olf.geometry import angular_distance, project_to_sphere
+
 from .trajectory import GhostTrajectory, transport_ghost
 
 
@@ -104,3 +106,80 @@ class GhostPopulation:
             transport_ghost(g, real_prev, real_now, step) for g in self._ghosts
         ]
         return out
+
+    def tension(self, step: float) -> dict:
+        """Measure disagreement among externally grounded future trajectories.
+
+        The pairwise Fréchet energy is permutation-invariant and does not need a
+        privileged thesis, antithesis, or ambient coordinate axis. Predictive
+        uncertainty supplies the scale against which disagreement is measured.
+        With fewer than two supported trajectories, tension is undefined rather
+        than evidence of agreement.
+        """
+        if len(self._ghosts) < 2:
+            return _undefined_tension(len(self._ghosts))
+
+        credibility = self.scalars("credibility").clamp_min(0.0)
+        grounding = self.scalars("grounding").clamp_min(0.0)
+        raw_weights = credibility * grounding
+        supported = raw_weights > 0.0
+        support_count = int(supported.sum().item())
+        if support_count < 2:
+            return _undefined_tension(support_count)
+
+        weights = raw_weights[supported]
+        weight_sum = weights.sum()
+        if float(weight_sum) <= torch.finfo(weights.dtype).eps:
+            return _undefined_tension(support_count)
+        weights = weights / weight_sum
+
+        futures = torch.stack(
+            [
+                ghost.predicted_anchor(step)
+                for ghost, keep in zip(self._ghosts, supported, strict=True)
+                if bool(keep)
+            ],
+            dim=0,
+        )
+        pairwise = angular_distance(futures[:, None, :], futures[None, :, :])
+        pair_weights = weights[:, None] * weights[None, :]
+        energy = 0.5 * torch.sum(pair_weights * pairwise.square())
+
+        uncertainty = self.scalars("uncertainty")[supported].clamp_min(0.0)
+        uncertainty_energy = torch.sum(weights * uncertainty.square())
+        denominator = energy + uncertainty_energy
+        normalized = torch.where(
+            denominator > torch.finfo(denominator.dtype).eps,
+            energy / denominator,
+            torch.zeros_like(denominator),
+        )
+        effective_support = 1.0 / torch.sum(weights.square()).clamp_min(
+            torch.finfo(weights.dtype).eps
+        )
+
+        resultant = torch.sum(weights[:, None] * futures, dim=0)
+        centroid = None
+        if float(resultant.norm()) > torch.finfo(resultant.dtype).eps:
+            centroid = project_to_sphere(resultant)
+
+        return {
+            "defined": True,
+            "supported": support_count,
+            "effective_support": float(effective_support),
+            "energy": float(energy),
+            "uncertainty_energy": float(uncertainty_energy),
+            "normalized": float(normalized.clamp(0.0, 1.0)),
+            "centroid": centroid,
+        }
+
+
+def _undefined_tension(supported: int) -> dict:
+    return {
+        "defined": False,
+        "supported": int(supported),
+        "effective_support": float(supported),
+        "energy": None,
+        "uncertainty_energy": None,
+        "normalized": None,
+        "centroid": None,
+    }
