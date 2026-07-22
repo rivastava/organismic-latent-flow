@@ -200,7 +200,7 @@ class GhostIntegration:
                         grounding=schema["strength"],
                         uncertainty=schema["uncertainty"],
                         evidence_support=schema["support"],
-                        horizon_expr=schema["strength"],
+                        horizon_expr=1.0 / max(float(schema.get("depth", 1)), 1.0),
                     )
                     for source, action, tangent in schema["evidence"]:
                         ghost = ghost.add_action_evidence(
@@ -369,6 +369,7 @@ class GhostIntegration:
         ghost_idx = list(range(len(self.population)))
         weights = h.new_zeros(len(ghost_idx))
         credibility_mass = 0.0
+        grounded_credibility_mass = 0.0
         combined_action = torch.zeros_like(base_action[0])
         reachable_flags = []
         ghost_indices = []
@@ -414,7 +415,7 @@ class GhostIntegration:
                 if action_conditioned:
                     desired_tangent = parallel_transport_sphere(
                         g.anchor, h, g.tangent
-                    )
+                    ) * g.horizon_expr
                     cand_action = torch.clamp(
                         g.transfer_inverse(desired_tangent, h), -1.0, 1.0
                     )
@@ -464,9 +465,15 @@ class GhostIntegration:
             else:
                 credibility = max(float(g.credibility), 0.0)
                 grounding = max(float(g.grounding), 0.0)
-                if action_conditioned:
+                externally_grounded = grounding > 0.0
+                if action_conditioned and externally_grounded:
                     credibility_mass += credibility
-                w = credibility * grounding if action_conditioned else 0.0
+                    grounded_credibility_mass += credibility * grounding
+                    w = credibility
+                else:
+                    w = 0.0
+                candidate_diag["predictive_credibility"] = credibility
+                candidate_diag["externally_grounded"] = externally_grounded
             weights[local_i] = w
             combined_action = combined_action + w * cand_action
             ghost_indices.append(g_index)
@@ -483,7 +490,7 @@ class GhostIntegration:
         diag["reachable_count"] = int(sum(reachable_flags))
         diag["weights"] = [float(w) for w in weights]
         diag["routing"] = (
-            "random" if self.config.random_routing else "grounded_credibility"
+            "random" if self.config.random_routing else "predictive_credibility"
         )
         diag["motor_valid_fraction"] = float(motor_valid_count(diag))
         diag["ghost_count_influencing"] = len(ghost_indices)
@@ -498,7 +505,10 @@ class GhostIntegration:
         support_amplitude = (
             1.0
             if self.config.random_routing
-            else min(1.0, total / max(credibility_mass, 1e-8))
+            else min(
+                1.0,
+                grounded_credibility_mass / max(credibility_mass, 1e-8),
+            )
         )
         synthesis = None
         if not self.config.random_routing and sigma_t is not None:
@@ -563,7 +573,7 @@ class GhostIntegration:
             for candidate in candidates
             if float(weights[candidate["local_index"]]) > 0.0
         ]
-        if len(model_indices) < 2 or len(supported_candidates) < 2:
+        if not model_indices or not supported_candidates:
             return None
 
         model_weights = weights[model_indices]

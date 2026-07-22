@@ -544,7 +544,7 @@ def test_grounding_without_action_evidence_remains_observational():
 
 # ---- transactional token ownership --------------------------------
 def test_one_pending_release_requires_one_recoupling():
-    org = _org("influence", ablation="no_reachability")  # make influence possible
+    org = _org("influence", ablation="random_routing")
     org.ghost.population.append(_grounded_ghost())
     obs = torch.randn(18).numpy()
     org.select_action(obs, evaluate=True)
@@ -574,7 +574,7 @@ def test_second_select_before_recouple_is_rejected():
 
 
 def test_pending_transaction_freezes_motor_release_context():
-    org = _org("influence", ablation="no_reachability")
+    org = _org("influence", ablation="random_routing")
     org.ghost.population.append(_grounded_ghost())
     obs = torch.randn(18).numpy()
     org.select_action(obs, evaluate=True)
@@ -631,7 +631,7 @@ def test_arbitrary_token_cannot_satisfy_recoupling():
 
 
 def test_missing_token_with_pending_refused():
-    org = _org("influence", ablation="no_reachability")
+    org = _org("influence", ablation="random_routing")
     org.ghost.population.append(_grounded_ghost())
     obs = torch.randn(18).numpy()
     org.select_action(obs, evaluate=True)
@@ -699,7 +699,7 @@ def test_telemetry_records_only_external_recoupling():
 
 # ---- boundary evaluation works after warmup -----------------------
 def test_boundary_eval_after_warmup_no_exception():
-    org = _org("influence", ablation="no_reachability")
+    org = _org("influence", ablation="random_routing")
     org.ghost.population.append(_grounded_ghost())
     org.veto.warmup = False  # exercise the differentiable boundary path
     obs = torch.randn(18).numpy()
@@ -732,6 +732,16 @@ def test_signature_path_waits_for_action_conditioned_evidence():
     a, info = org.select_action(obs, evaluate=True)
     assert not (info["ghost"] or {}).get("ghost_influenced")
     assert info["ghost"]["candidates"][0]["action_conditioned"] is False
+
+
+def test_single_grounded_future_is_compared_with_ordinary_path():
+    org = _org("influence", ablation="no_reachability")
+    org.ghost.population.append(_grounded_ghost())
+    _, info = org.select_action(torch.randn(18).numpy(), evaluate=True)
+    ghost_info = info["ghost"]
+    assert ghost_info["routing"] == "pareto_synthesis"
+    assert ghost_info["synthesis_model_count"] == 1
+    assert ghost_info["synthesis_candidate_count"] == 2
 
 
 def test_antipodal_ghost_candidate_is_undefined_not_fatal():
@@ -809,7 +819,7 @@ def test_reachability_action_conditioned_excludes_incompatible():
 
 # ---- honest, real-property assertions ----------------------------
 def test_final_boundary_evaluates_combined_ghost_action():
-    org = _org("influence", ablation="no_reachability")
+    org = _org("influence", ablation="random_routing")
     org.ghost.population.append(_grounded_ghost())
     obs = torch.randn(18).numpy()
     a, info = org.select_action(obs, evaluate=True)

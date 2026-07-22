@@ -2,6 +2,7 @@ import torch
 
 from olf.geometry import project_to_sphere, project_to_tangent
 from olf.ghosts.config import GhostConfig
+from olf.ghosts.evidence import update_after_recoupling
 from olf.ghosts.integration import _non_dominated_indices
 from olf.ghosts.lifecycle import (
     LifecycleReport,
@@ -35,6 +36,51 @@ def test_tension_requires_two_grounded_alternatives():
 
     ungrounded = make_ghost(anchor, -tangent, credibility=1.0, grounding=0.0)
     assert not _population(ghost, ungrounded).tension(1.0)["defined"]
+
+
+def test_credibility_is_observed_positive_evidence_fraction():
+    anchor = project_to_sphere(torch.randn(8))
+    tangent = 0.2 * project_to_tangent(anchor, torch.randn(8))
+    ghost = make_ghost(
+        anchor,
+        tangent,
+        credibility=0.5,
+        evidence_support=0.3,
+        evidence_negative=0.1,
+    )
+    observed = ghost.predicted_anchor(1.0)
+    updated = update_after_recoupling(
+        ghost,
+        observed,
+        1.0,
+        torch.tensor(0.4),
+    )
+    expected = updated.evidence_support / (
+        updated.evidence_support + updated.evidence_negative
+    )
+    assert torch.allclose(updated.credibility, expected)
+
+    contradicted = update_after_recoupling(
+        updated,
+        -observed,
+        1.0,
+        torch.tensor(0.0),
+    )
+    expected = contradicted.evidence_support / (
+        contradicted.evidence_support + contradicted.evidence_negative
+    )
+    assert torch.allclose(contradicted.credibility, expected)
+    assert contradicted.credibility < updated.credibility
+
+
+def test_horizon_expresses_nonlocal_future_as_local_correction():
+    anchor = project_to_sphere(torch.randn(8))
+    tangent = 0.4 * project_to_tangent(anchor, torch.randn(8))
+    ghost = make_ghost(anchor, tangent, horizon_expr=0.25)
+    expected = ghost.with_updates(horizon_expr=torch.tensor(1.0)).predicted_anchor(
+        0.25
+    )
+    torch.testing.assert_close(ghost.predicted_anchor(1.0), expected)
 
 
 def test_tension_is_set_and_frame_invariant():
@@ -188,6 +234,29 @@ def test_recursive_schema_branch_requires_external_predictive_evidence():
     )
     separated_branches = separated.composed_schemas(separated_anchor, 4)
     assert all(branch["depth"] == 1 for branch in separated_branches)
+
+
+def test_composed_schema_restores_inverse_depth_horizon():
+    buffer, anchor = _alternating_schema_buffer()
+    config = GhostConfig(
+        ghost_mode="influence", latent_dim=8, action_dim=3, capacity=4
+    )
+    organism = Organism(
+        obs_dim=18,
+        latent_dim=8,
+        hidden_dim=16,
+        ghost_mode="influence",
+        ghost_config=config,
+    )
+    organism.ghost.buffer = buffer
+    organism.ghost.reset()
+    schemas = buffer.composed_schemas(anchor, config.capacity)
+    organism.ghost.begin_step(anchor)
+    assert len(organism.ghost.population) == len(schemas)
+    for ghost, schema in zip(
+        organism.ghost.population._ghosts, schemas, strict=True
+    ):
+        assert abs(float(ghost.horizon_expr) - 1.0 / schema["depth"]) < 1e-7
 
 
 def test_recursive_schema_composition_is_frame_equivariant():

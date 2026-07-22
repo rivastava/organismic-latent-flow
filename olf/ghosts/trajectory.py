@@ -13,7 +13,7 @@ substrate. It carries only role-free, observable quantities:
   - evidence_support:    scalar >= 0  (cumulative POSITIVE external support)
   - evidence_negative:   scalar >= 0  (cumulative NEGATIVE external support)
   - boundary_compat: scalar in [0, 1] (boundary risk track record)
-  - horizon_expr: scalar in [0, 1] (strength of its future expression)
+  - horizon_expr: scalar in (0, 1] (local expression of its future horizon)
 
 No semantic label, task, identity, world, relation, or reward field exists.
 
@@ -136,7 +136,10 @@ class GhostTrajectory:
             anchor = self.anchor
         anchor = project_to_sphere(anchor.detach().reshape(-1))
         if action is None:
-            return exponential_map(anchor, self.tangent * step)
+            return exponential_map(
+                anchor,
+                self.tangent * step * self.horizon_expr,
+            )
         pred_tan = self.transfer_predict(action, anchor)
         return exponential_map(anchor, pred_tan * step)
 

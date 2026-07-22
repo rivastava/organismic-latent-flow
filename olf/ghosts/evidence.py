@@ -79,9 +79,9 @@ def update_after_recoupling(
       positive  = relu(advantage)       (ghost predicts better than baseline)
       negative  = relu(-advantage)      (baseline predicts better than ghost)
 
-    Grounding rises ONLY with positive evidence. Credibility rises with
-    positive evidence and falls with negative evidence. Internal rollout can
-    never call this; grounding/evidence are manufactured only here.
+    Grounding rises ONLY with positive evidence. Credibility is the fraction
+    of accumulated contrastive evidence that is positive. Internal rollout
+    can never call this; grounding/evidence are manufactured only here.
     """
     err = (
         predictive_error(ghost, observed_anchor, step)
@@ -93,14 +93,17 @@ def update_after_recoupling(
     negative = torch.relu(-advantage)
 
     new_ground = torch.clamp(ghost.grounding + learning_rate * positive, 0.0, 1.0)
-    new_cred = torch.clamp(
-        ghost.credibility + learning_rate * (positive - negative), 0.0, 1.0
-    )
     new_unc = torch.clamp(
         ghost.uncertainty * (1.0 - learning_rate) + err * learning_rate, 0.0, 1e6
     )
     new_pos = ghost.evidence_support + positive
     new_neg = ghost.evidence_negative + negative
+    evidence_total = new_pos + new_neg
+    new_cred = torch.where(
+        evidence_total > torch.finfo(evidence_total.dtype).eps,
+        new_pos / evidence_total,
+        ghost.credibility,
+    )
     new_persist = ghost.persistence + 1.0
     return ghost.with_updates(
         credibility=new_cred,
